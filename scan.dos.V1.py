@@ -1,134 +1,182 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+import matplotlib.cm as mcm
 from scipy.signal import savgol_filter
-import tempfile
+import tempfile, os
 from datetime import datetime
-from plyfile import PlyData
 
+# PDF
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Image, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.units import cm as cm_unit
+from reportlab.lib.units import cm
 
-# ================= STREAMLIT CONFIG =================
-st.set_page_config(page_title="Analyse Rachidienne 3D", layout="wide")
-st.title("🦴 Analyse Rachidienne 3D – Cloud Safe")
-st.markdown("---")
+# ==============================
+# CONFIG STREAMLIT
+# ==============================
+st.set_page_config(page_title="Analyse Rachis 3D IA", layout="wide")
+st.title("🦴 Analyse rachidienne 3D – Synthèse clinique")
 
-# ================= SIDEBAR =================
+# ==============================
+# OUTILS
+# ==============================
+def compute_cobb_angle(x, y):
+    dy = np.gradient(y)
+    dx = np.gradient(x)
+    slopes = dx / (dy + 1e-6)
+    a1 = np.arctan(slopes.max())
+    a2 = np.arctan(slopes.min())
+    return np.degrees(abs(a1 - a2))
+
+
+def compute_sagittal_arrows(spine_cm):
+    y = spine_cm[:, 1]
+    z = spine_cm[:, 2]
+    z_ref = np.linspace(z[0], z[-1], len(z))
+    delta = z - z_ref
+    fleche_dorsale = abs(np.min(delta))
+    fleche_lombaire = abs(np.max(delta))
+    return fleche_dorsale, fleche_lombaire, z_ref
+
+
+def render_projection(points_cm, spine_cm, mode="front", z_ref=None):
+    fig, ax = plt.subplots(figsize=(5, 7))
+
+    if mode == "front":
+        ax.scatter(points_cm[:, 0], points_cm[:, 1], s=1, alpha=0.15)
+        ax.plot(spine_cm[:, 0], spine_cm[:, 1], color="red", linewidth=2)
+        ax.set_title("Vue frontale")
+
+    if mode == "side":
+        ax.scatter(points_cm[:, 2], points_cm[:, 1], s=1, alpha=0.15)
+        ax.plot(spine_cm[:, 2], spine_cm[:, 1], color="red", linewidth=2)
+        if z_ref is not None:
+            ax.plot(z_ref, spine_cm[:, 1], "--", color="black", linewidth=2)
+        ax.set_title("Vue sagittale")
+
+    ax.set_aspect("equal")
+    ax.invert_yaxis()
+    ax.grid(True)
+    return fig
+
+
+def export_pdf(results, img_front, img_side):
+    tmp = tempfile.gettempdir()
+    pdf_path = os.path.join(tmp, "rapport_rachis.pdf")
+
+    styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(pdf_path)
+    story = []
+
+    story.append(Paragraph("<b>Rapport d'analyse rachidienne 3D</b>", styles["Title"]))
+    story.append(Spacer(1, 0.4 * cm))
+
+    for k, v in results.items():
+        story.append(Paragraph(f"<b>{k}</b> : {v}", styles["Normal"]))
+
+    story.append(Spacer(1, 0.5 * cm))
+    story.append(Image(img_front, width=7 * cm, height=10 * cm))
+    story.append(Spacer(1, 0.3 * cm))
+    story.append(Image(img_side, width=7 * cm, height=10 * cm))
+
+    doc.build(story)
+    return pdf_path
+
+# ==============================
+# SIDEBAR – PARAMÈTRES
+# ==============================
 with st.sidebar:
     st.header("👤 Patient")
     nom = st.text_input("Nom", "Anonyme")
     prenom = st.text_input("Prénom", "")
+    st.divider()
+
+    smooth = st.checkbox("Activer le lissage", True)
+    smooth_level = st.slider("Intensité lissage", 5, 40, 20)
+    k_std = st.slider("Tolérance axe (K × std)", 0.5, 3.0, 1.5)
 
     st.divider()
-    st.header("⚙️ Paramètres")
-    smooth = st.checkbox("Activer le lissage", True)
-    smooth_level = st.slider("Niveau lissage", 5, 51, 31, step=2)
-    k_std = st.slider("Tolérance filtrage (K×std)", 0.5, 3.0, 1.5, 0.1)
+    ply_file = st.file_uploader("📂 Charger un scan PLY", type=["ply"])
 
-# ================= OUTILS =================
-def load_ply_numpy(file):
-    ply = PlyData.read(file)
-    v = ply["vertex"]
-    return np.vstack([v["x"], v["y"], v["z"]]).T
+# ==============================
+# TRAITEMENT
+# ==============================
+if ply_file:
+    pts = np.loadtxt(ply_file, skiprows=10)[:, :3]  # fallback simple PLY ascii
+    pts *= 0.1  # mm → cm
 
-def compute_cobb(x, y):
-    dy = np.gradient(y)
-    dx = np.gradient(x)
-    slopes = dx / (dy + 1e-6)
-    return np.degrees(abs(np.arctan(slopes.max()) - np.arctan(slopes.min())))
+    # Nettoyage Y
+    y_vals = pts[:, 1]
+    mask = (y_vals > np.percentile(y_vals, 5)) & (y_vals < np.percentile(y_vals, 95))
+    pts = pts[mask]
 
-def generate_pdf(data, img):
-    filename = f"Rapport_Rachis_{data['Nom']}.pdf"
-    styles = getSampleStyleSheet()
-    doc = SimpleDocTemplate(filename)
-    story = []
+    # Centrage
+    pts[:, 0] -= pts[:, 0].mean()
+    pts[:, 2] -= pts[:, 2].mean()
 
-    story.append(Paragraph("<b>Rapport d’analyse rachidienne</b>", styles["Title"]))
-    story.append(Spacer(1, 0.4 * cm_unit))
+    # Extraction axe
+    slices = np.linspace(pts[:, 1].min(), pts[:, 1].max(), 60)
+    spine = []
+    for i in range(len(slices) - 1):
+        sl = pts[(pts[:, 1] >= slices[i]) & (pts[:, 1] < slices[i + 1])]
+        if len(sl) == 0:
+            continue
+        x_mean, x_std = sl[:, 0].mean(), sl[:, 0].std()
+        sl = sl[(sl[:, 0] > x_mean - k_std * x_std) & (sl[:, 0] < x_mean + k_std * x_std)]
+        spine.append([sl[:, 0].mean(), sl[:, 1].mean(), sl[:, 2].mean()])
 
-    for k, v in data.items():
-        story.append(Paragraph(f"<b>{k} :</b> {v}", styles["Normal"]))
+    spine = np.array(spine)
+    spine = spine[np.argsort(spine[:, 1])]
 
-    story.append(Spacer(1, 0.4 * cm_unit))
-    story.append(Image(img, width=16 * cm_unit, height=8 * cm_unit))
+    if smooth and len(spine) > 7:
+        win = min(len(spine) // 2 * 2 + 1, smooth_level)
+        spine[:, 0] = savgol_filter(spine[:, 0], win, 3)
+        spine[:, 2] = savgol_filter(spine[:, 2], win, 3)
 
-    doc.build(story)
-    return filename
+    # ==============================
+    # MESURES
+    # ==============================
+    x, y, z = spine.T
+    cobb = compute_cobb_angle(x, y)
+    frontal_dev = np.max(np.abs(x))
+    sagittal_dev = np.max(np.abs(z))
+    fleche_dorsale, fleche_lombaire, z_ref = compute_sagittal_arrows(spine)
 
-# ================= UPLOAD =================
-uploaded = st.file_uploader("📁 Charger un fichier PLY", type="ply")
+    # ==============================
+    # VISU
+    # ==============================
+    fig_front = render_projection(pts, spine, "front")
+    fig_side = render_projection(pts, spine, "side", z_ref=z_ref)
 
-if uploaded:
-    pts = load_ply_numpy(uploaded)
+    tmp = tempfile.gettempdir()
+    img_front = os.path.join(tmp, "front.png")
+    img_side = os.path.join(tmp, "side.png")
+    fig_front.savefig(img_front, bbox_inches="tight")
+    fig_side.savefig(img_side, bbox_inches="tight")
 
-    if st.button("⚙️ LANCER L'ANALYSE", use_container_width=True):
-        with st.spinner("Analyse de la colonne vertébrale..."):
+    col1, col2 = st.columns(2)
+    col1.pyplot(fig_front)
+    col2.pyplot(fig_side)
 
-            # Nettoyage
-            y = pts[:, 1]
-            mask = (y > np.percentile(y, 5)) & (y < np.percentile(y, 95))
-            pts = pts[mask]
+    # ==============================
+    # SYNTHÈSE
+    # ==============================
+    results = {
+        "Patient": f"{prenom} {nom}",
+        "Date": datetime.now().strftime("%d/%m/%Y"),
+        "Angle de Cobb": f"{cobb:.1f} °",
+        "Déviation frontale max": f"{frontal_dev:.2f} cm",
+        "Déviation sagittale max": f"{sagittal_dev:.2f} cm",
+        "Flèche dorsale": f"{fleche_dorsale:.2f} cm",
+        "Flèche lombaire": f"{fleche_lombaire:.2f} cm",
+    }
 
-            pts[:, 0] -= pts[:, 0].mean()
-            pts[:, 2] -= pts[:, 2].mean()
+    st.subheader("📋 Synthèse clinique")
+    st.table(results)
 
-            # Extraction axe
-            slices = np.linspace(pts[:, 1].min(), pts[:, 1].max(), 50)
-            spine = []
-
-            for i in range(len(slices) - 1):
-                sl = pts[(pts[:, 1] >= slices[i]) & (pts[:, 1] < slices[i + 1])]
-                if len(sl) == 0:
-                    continue
-                xm, xs = sl[:, 0].mean(), sl[:, 0].std()
-                sl = sl[(sl[:, 0] > xm - k_std * xs) & (sl[:, 0] < xm + k_std * xs)]
-                if len(sl):
-                    spine.append(sl.mean(axis=0))
-
-            spine = np.array(spine)
-            spine = spine[np.argsort(spine[:, 1])]
-
-            if smooth and len(spine) > 7:
-                spine[:, 0] = savgol_filter(spine[:, 0], smooth_level, 3)
-                spine[:, 2] = savgol_filter(spine[:, 2], smooth_level, 3)
-
-            spine_cm = spine / 10
-            x, y, z = spine_cm.T
-
-            cobb = compute_cobb(x, y)
-            frontal = np.max(np.abs(x))
-            sagittal = np.max(np.abs(z))
-
-            # Graphique
-            fig, ax = plt.subplots(1, 2, figsize=(12, 5))
-            ax[0].plot(x, y)
-            ax[0].set_title(f"Vue frontale – Cobb {cobb:.1f}°")
-            ax[0].set_aspect("equal")
-            ax[0].grid()
-
-            ax[1].plot(z, y)
-            ax[1].set_title("Vue sagittale")
-            ax[1].set_aspect("equal")
-            ax[1].grid()
-
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-            plt.savefig(tmp.name)
-            st.pyplot(fig)
-
-            results = {
-                "Nom": nom,
-                "Prénom": prenom,
-                "Angle de Cobb": f"{cobb:.2f}°",
-                "Déviation frontale max": f"{frontal:.2f} cm",
-                "Déviation sagittale max": f"{sagittal:.2f} cm"
-            }
-
-            st.subheader("📊 Résultats")
-            st.table(results)
-
-            pdf = generate_pdf(results, tmp.name)
-            with open(pdf, "rb") as f:
-                st.download_button("📥 Télécharger le PDF", f, pdf, "application/pdf")
+    # ==============================
+    # PDF
+    # ==============================
+    pdf_path = export_pdf(results, img_front, img_side)
+    with open(pdf_path, "rb") as f:
+        st.download_button("📥 Télécharger le rapport PDF", f, "rapport_rachis.pdf")
