@@ -1,133 +1,81 @@
-# ================= OPEN3D CLOUD SAFE =================
-import os
-os.environ["OPEN3D_CPU_RENDERING"] = "true"
-
-# ================= IMPORTS =================
 import streamlit as st
 import numpy as np
-import open3d as o3d
 import matplotlib.pyplot as plt
-import matplotlib.cm as mcm
+import matplotlib.cm as cm
 from scipy.signal import savgol_filter
 import tempfile
 from datetime import datetime
+from plyfile import PlyData
 
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Image, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.units import cm
+from reportlab.lib.units import cm as cm_unit
 
 # ================= STREAMLIT CONFIG =================
-st.set_page_config(
-    page_title="Analyse Rachidienne 3D",
-    layout="wide"
-)
-
-st.title("🦴 Analyse Rachidienne 3D – IA")
+st.set_page_config(page_title="Analyse Rachidienne 3D", layout="wide")
+st.title("🦴 Analyse Rachidienne 3D – Cloud Safe")
 st.markdown("---")
 
 # ================= SIDEBAR =================
 with st.sidebar:
     st.header("👤 Patient")
-    nom = st.text_input("Nom", value="Anonyme")
-    prenom = st.text_input("Prénom", value="")
+    nom = st.text_input("Nom", "Anonyme")
+    prenom = st.text_input("Prénom", "")
 
     st.divider()
     st.header("⚙️ Paramètres")
-
-    smooth_enabled = st.checkbox("Activer le lissage", value=True)
-    smooth_level = st.slider("Niveau de lissage", 5, 50, 30)
-    k_std = st.slider("Tolérance filtrage frontal (K×std)", 0.5, 3.0, 1.5, 0.1)
+    smooth = st.checkbox("Activer le lissage", True)
+    smooth_level = st.slider("Niveau lissage", 5, 51, 31, step=2)
+    k_std = st.slider("Tolérance filtrage (K×std)", 0.5, 3.0, 1.5, 0.1)
 
 # ================= OUTILS =================
-def compute_cobb_angle(x, y):
+def load_ply_numpy(file):
+    ply = PlyData.read(file)
+    v = ply["vertex"]
+    return np.vstack([v["x"], v["y"], v["z"]]).T
+
+def compute_cobb(x, y):
     dy = np.gradient(y)
     dx = np.gradient(x)
     slopes = dx / (dy + 1e-6)
-    a1 = np.arctan(slopes.max())
-    a2 = np.arctan(slopes.min())
-    return np.degrees(abs(a1 - a2))
+    return np.degrees(abs(np.arctan(slopes.max()) - np.arctan(slopes.min())))
 
-def capture_3d_image(pcd, spine, filename):
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(visible=False)
-
-    vis.add_geometry(pcd)
-
-    lines = [[i, i + 1] for i in range(len(spine) - 1)]
-    line_set = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(spine),
-        lines=o3d.utility.Vector2iVector(lines)
-    )
-    line_set.colors = o3d.utility.Vector3dVector([[1, 0, 0]] * len(lines))
-    vis.add_geometry(line_set)
-
-    vis.poll_events()
-    vis.update_renderer()
-    vis.capture_screen_image(filename)
-    vis.destroy_window()
-
-def generate_pdf(data, img_graphes, img_3d):
+def generate_pdf(data, img):
     filename = f"Rapport_Rachis_{data['Nom']}.pdf"
     styles = getSampleStyleSheet()
     doc = SimpleDocTemplate(filename)
     story = []
 
-    story.append(Paragraph("<b>Rapport d'analyse rachidienne 3D</b>", styles["Title"]))
-    story.append(Spacer(1, 0.4 * cm))
-
-    story.append(Paragraph(
-        f"<b>Patient :</b> {data['Prenom']} {data['Nom']}", styles["Normal"]
-    ))
-    story.append(Paragraph(
-        f"<b>Date :</b> {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles["Normal"]
-    ))
-
-    story.append(Spacer(1, 0.3 * cm))
+    story.append(Paragraph("<b>Rapport d’analyse rachidienne</b>", styles["Title"]))
+    story.append(Spacer(1, 0.4 * cm_unit))
 
     for k, v in data.items():
-        if k not in ["Nom", "Prenom"]:
-            story.append(Paragraph(f"<b>{k} :</b> {v}", styles["Normal"]))
+        story.append(Paragraph(f"<b>{k} :</b> {v}", styles["Normal"]))
 
-    story.append(Spacer(1, 0.4 * cm))
-    story.append(Image(img_graphes, width=16 * cm, height=7 * cm))
-    story.append(Spacer(1, 0.4 * cm))
-    story.append(Image(img_3d, width=16 * cm, height=10 * cm))
+    story.append(Spacer(1, 0.4 * cm_unit))
+    story.append(Image(img, width=16 * cm_unit, height=8 * cm_unit))
 
     doc.build(story)
     return filename
 
 # ================= UPLOAD =================
-uploaded_file = st.file_uploader("📁 Charger un fichier PLY", type=["ply"])
+uploaded = st.file_uploader("📁 Charger un fichier PLY", type="ply")
 
-if uploaded_file:
-    tmp_ply = tempfile.NamedTemporaryFile(delete=False, suffix=".ply")
-    tmp_ply.write(uploaded_file.read())
-    tmp_ply.close()
+if uploaded:
+    pts = load_ply_numpy(uploaded)
 
     if st.button("⚙️ LANCER L'ANALYSE", use_container_width=True):
-        with st.spinner("Analyse 3D de la colonne vertébrale..."):
+        with st.spinner("Analyse de la colonne vertébrale..."):
 
-            # ---------- Chargement ----------
-            pcd = o3d.io.read_point_cloud(tmp_ply.name)
-
-            # Sécurité cloud : sous-échantillonnage
-            pcd = pcd.voxel_down_sample(voxel_size=2.0)
-
-            pts = np.asarray(pcd.points)
-
-            # ---------- Nettoyage ----------
-            y_vals = pts[:, 1]
-            mask = (y_vals > np.percentile(y_vals, 5)) & (y_vals < np.percentile(y_vals, 95))
+            # Nettoyage
+            y = pts[:, 1]
+            mask = (y > np.percentile(y, 5)) & (y < np.percentile(y, 95))
             pts = pts[mask]
 
             pts[:, 0] -= pts[:, 0].mean()
             pts[:, 2] -= pts[:, 2].mean()
 
-            # ---------- Couleurs ----------
-            z_norm = (pts[:, 2] - pts[:, 2].min()) / (pts[:, 2].ptp() + 1e-6)
-            pcd.colors = o3d.utility.Vector3dVector(mcm.viridis(z_norm)[:, :3])
-
-            # ---------- Axe rachidien ----------
+            # Extraction axe
             slices = np.linspace(pts[:, 1].min(), pts[:, 1].max(), 50)
             spine = []
 
@@ -135,84 +83,52 @@ if uploaded_file:
                 sl = pts[(pts[:, 1] >= slices[i]) & (pts[:, 1] < slices[i + 1])]
                 if len(sl) == 0:
                     continue
-
-                x_mean = sl[:, 0].mean()
-                x_std = sl[:, 0].std()
-                mask_x = (sl[:, 0] > x_mean - k_std * x_std) & (sl[:, 0] < x_mean + k_std * x_std)
-                sl = sl[mask_x]
-
-                if len(sl) == 0:
-                    continue
-
-                spine.append([
-                    sl[:, 0].mean(),
-                    sl[:, 1].mean(),
-                    sl[:, 2].mean()
-                ])
+                xm, xs = sl[:, 0].mean(), sl[:, 0].std()
+                sl = sl[(sl[:, 0] > xm - k_std * xs) & (sl[:, 0] < xm + k_std * xs)]
+                if len(sl):
+                    spine.append(sl.mean(axis=0))
 
             spine = np.array(spine)
             spine = spine[np.argsort(spine[:, 1])]
 
-            # ---------- Lissage ----------
-            if smooth_enabled and len(spine) > 7:
-                window = min(len(spine) // 2 * 2 + 1, smooth_level * 2 + 1)
-                spine[:, 0] = savgol_filter(spine[:, 0], window, 3)
-                spine[:, 2] = savgol_filter(spine[:, 2], window, 3)
+            if smooth and len(spine) > 7:
+                spine[:, 0] = savgol_filter(spine[:, 0], smooth_level, 3)
+                spine[:, 2] = savgol_filter(spine[:, 2], smooth_level, 3)
 
             spine_cm = spine / 10
             x, y, z = spine_cm.T
 
-            # ---------- Indicateurs ----------
-            cobb = compute_cobb_angle(x, y)
-            frontal_dev = np.max(np.abs(x))
-            sagittal_dev = np.max(np.abs(z))
+            cobb = compute_cobb(x, y)
+            frontal = np.max(np.abs(x))
+            sagittal = np.max(np.abs(z))
 
-            # ---------- Graphiques ----------
-            tmpdir = tempfile.gettempdir()
-            img_graphes = os.path.join(tmpdir, "graphes.png")
-            img_3d = os.path.join(tmpdir, "spine3d.png")
+            # Graphique
+            fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+            ax[0].plot(x, y)
+            ax[0].set_title(f"Vue frontale – Cobb {cobb:.1f}°")
+            ax[0].set_aspect("equal")
+            ax[0].grid()
 
-            fig, axs = plt.subplots(1, 2, figsize=(12, 5))
-            axs[0].plot(x, y, linewidth=2)
-            axs[0].set_title(f"Vue frontale – Cobb {cobb:.1f}°")
-            axs[0].set_aspect("equal")
-            axs[0].grid(True)
+            ax[1].plot(z, y)
+            ax[1].set_title("Vue sagittale")
+            ax[1].set_aspect("equal")
+            ax[1].grid()
 
-            axs[1].plot(z, y, linewidth=2)
-            axs[1].set_title("Vue sagittale")
-            axs[1].set_aspect("equal")
-            axs[1].grid(True)
-
-            plt.tight_layout()
-            plt.savefig(img_graphes)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            plt.savefig(tmp.name)
             st.pyplot(fig)
 
-            # ---------- Image 3D ----------
-            capture_3d_image(pcd, spine, img_3d)
-            st.image(img_3d, caption="Reconstruction 3D rachidienne")
-
-            # ---------- Résultats ----------
             results = {
                 "Nom": nom,
-                "Prenom": prenom,
+                "Prénom": prenom,
                 "Angle de Cobb": f"{cobb:.2f}°",
-                "Déviation frontale max": f"{frontal_dev:.2f} cm",
-                "Déviation sagittale max": f"{sagittal_dev:.2f} cm",
-                "Lissage activé": smooth_enabled,
-                "Niveau lissage": smooth_level,
-                "Tolérance K": k_std
+                "Déviation frontale max": f"{frontal:.2f} cm",
+                "Déviation sagittale max": f"{sagittal:.2f} cm"
             }
 
-            st.subheader("📊 Résultats cliniques")
+            st.subheader("📊 Résultats")
             st.table(results)
 
-            # ---------- PDF ----------
-            pdf_path = generate_pdf(results, img_graphes, img_3d)
-            with open(pdf_path, "rb") as f:
-                st.download_button(
-                    "📥 Télécharger le rapport PDF",
-                    f,
-                    file_name=pdf_path,
-                    mime="application/pdf",
-                    use_container_width=True
-                )
+            pdf = generate_pdf(results, tmp.name)
+            with open(pdf, "rb") as f:
+                st.download_button("📥 Télécharger le PDF", f, pdf, "application/pdf")
