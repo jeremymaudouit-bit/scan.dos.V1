@@ -1,9 +1,6 @@
 streamlit>=1.30
-
 numpy
 scipy
 matplotlib
-pillow
 reportlab
-
-open3d==0.17.0
+plyfile
