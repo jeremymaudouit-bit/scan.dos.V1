@@ -30,7 +30,7 @@ st.markdown("""
     .stButton>button { background-color: #2c3e50; color: white; width: 100%; border-radius: 8px; font-weight: bold; }
     .disclaimer { font-size: 0.85rem; color: #555; font-style: italic; margin-top: 15px; border-left: 3px solid #ccc; padding-left: 10px;}
     </style>
-    """, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # ==============================
 # FONCTIONS TECHNIQUES
@@ -40,19 +40,33 @@ def load_ply_numpy(file):
     v = plydata['vertex']
     return np.vstack([v['x'], v['y'], v['z']]).T
 
-def compute_cobb_angle(x, y):
-    dy, dx = np.gradient(y), np.gradient(x)
-    slopes = dx / (dy + 1e-6)
-    return np.degrees(abs(np.arctan(slopes.max()) - np.arctan(slopes.min())))
-
-def compute_sagittal_arrows(spine_cm):
+def compute_sagittal_arrows_v2(spine_cm):
+    """
+    Mesure des flèches sagittales selon :
+    - Verticale au niveau du point convexe dorsal
+    - Distance de la lordose lombaire jusqu'à la tangente dorsale
+    """
     y = spine_cm[:, 1]
     z = spine_cm[:, 2]
+
+    # Tangente dorsale : ligne entre z[0] et z[-1]
     z_ref_line = np.linspace(z[0], z[-1], len(z))
-    delta = z - z_ref_line
-    f_dorsale = abs(np.max(delta))
-    f_lombaire = abs(np.min(delta))
-    return f_dorsale, f_lombaire, z_ref_line
+
+    # Point convexe dorsal (max de z)
+    idx_convexe = np.argmax(z)
+    z_convexe = z[idx_convexe]
+
+    # Point lordose lombaire (min de z)
+    idx_lombaire = np.argmin(z)
+    z_lombaire = z[idx_lombaire]
+
+    # Flèche dorsale = distance verticale du convexe à la tangente
+    fd = abs(z_convexe - z_ref_line[idx_convexe])
+
+    # Flèche lombaire = distance verticale lordose lombaire à tangente
+    fl = abs(z_lombaire - z_ref_line[idx_lombaire])
+
+    return fd, fl, z_ref_line
 
 def export_pdf_pro(patient_info, results, img_f, img_s):
     tmp = tempfile.gettempdir()
@@ -67,9 +81,9 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
     story.append(Paragraph(f"<b>Patient :</b> {patient_info['prenom']} {patient_info['nom']}", styles['Normal']))
     
     data = [["Indicateur", "Valeur Mesurée"], 
-            ["Angle de Cobb (Est.)", f"{results['cobb']:.1f}°"],
             ["Flèche Dorsale", f"{results['fd']:.2f} cm"],
-            ["Flèche Lombaire", f"{results['fl']:.2f} cm"]]
+            ["Flèche Lombaire", f"{results['fl']:.2f} cm"],
+            ["Déviation Latérale Max", f"{results['dev_f']:.2f} cm"]]
     
     t = Table(data, colWidths=[7*cm, 7*cm])
     t.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor("#2c3e50")),
@@ -78,7 +92,7 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
                            ('ALIGN', (0,0), (-1,-1), 'CENTER')]))
     story.append(t)
     story.append(Spacer(0.5, 1*cm))
-    story.append(Paragraph("<i>Note : L'angle de Cobb est une estimation issue d'une analyse par centre des surfaces de chaque tranche.</i>", styles['Italic']))
+    story.append(Paragraph("<i>Note : Les flèches sagittales sont calculées selon la verticale au niveau du point convexe dorsal.</i>", styles['Italic']))
     story.append(Spacer(1, 1*cm))
     
     img_t = Table([[PDFImage(img_f, width=6*cm, height=9*cm), PDFImage(img_s, width=6*cm, height=9*cm)]])
@@ -114,7 +128,6 @@ if ply_file:
         for i in range(len(slices)-1):
             sl = pts[(pts[:,1]>=slices[i]) & (pts[:,1]<slices[i+1])]
             if len(sl) > 5:
-                # Calcul par centre des surfaces (moyenne x et z de la tranche)
                 mx, sx = sl[:,0].mean(), sl[:,0].std()
                 sl = sl[(sl[:,0] > mx - k_std*sx) & (sl[:,0] < mx + k_std*sx)]
                 if len(sl) > 0:
@@ -125,8 +138,8 @@ if ply_file:
             spine[:,0] = savgol_filter(spine[:,0], smooth_val, 3)
             spine[:,2] = savgol_filter(spine[:,2], smooth_val, 3)
 
-        cobb = compute_cobb_angle(spine[:,0], spine[:,1])
-        fd, fl, z_ref = compute_sagittal_arrows(spine)
+        # --- FLÈCHES SAGITTALES ---
+        fd, fl, z_ref = compute_sagittal_arrows_v2(spine)
         dev_f = np.max(np.abs(spine[:,0]))
 
         # --- GRAPHES (CENTRES) ---
@@ -148,7 +161,7 @@ if ply_file:
         ax_s.axis('off')
         fig_s.savefig(img_s_p, bbox_inches='tight', dpi=150)
 
-        # --- AFFICHAGE ÉPURÉ (PLUS DE CARRÉS BLANCS) ---
+        # --- AFFICHAGE ÉPURÉ ---
         st.write("### 📈 Analyse Visuelle")
         _, v1, v2, _ = st.columns([1, 1, 1, 1])
         v1.pyplot(fig_f)
@@ -157,18 +170,17 @@ if ply_file:
         st.write("### 📋 Synthèse des résultats")
         st.markdown(f"""
         <div class="result-box">
-            <p><b>📐 Angle de Cobb (Est.) :</b> <span class="value-text">{cobb:.1f}°</span></p>
             <p><b>📏 Flèche Dorsale :</b> <span class="value-text">{fd:.2f} cm</span></p>
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Note : L'angle de Cobb est une estimation issue d'une analyse par centre des surfaces de chaque tranche.
+                Note : La mesure des flèches est calculée selon la verticale au niveau du point convexe dorsal.
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # --- EXPORT ---
-        res = {"cobb": cobb, "fd": fd, "fl": fl, "dev_f": dev_f}
+        # --- EXPORT PDF ---
+        res = {"fd": fd, "fl": fl, "dev_f": dev_f}
         pdf_path = export_pdf_pro({"nom": nom, "prenom": prenom}, res, img_f_p, img_s_p)
         
         st.divider()
