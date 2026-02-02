@@ -1,3 +1,10 @@
-streamlit
-pandas
+streamlit>=1.30
+
 numpy
+scipy
+matplotlib
+
+open3d==0.18.0
+
+reportlab
+pillow
