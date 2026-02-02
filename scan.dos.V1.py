@@ -42,26 +42,26 @@ def compute_sagittal_arrows(spine_cm):
     fleche_lombaire = abs(np.max(delta))
     return fleche_dorsale, fleche_lombaire, z_ref
 
-def render_projection(points_cm, spine_cm, mode="front", z_ref=None, height_ratio=5):
+def render_projection(points_cm, spine_cm, mode="front", z_ref=None, height_ratio=4):
     """Rendu 2D frontale ou sagittale pour Streamlit"""
     fig, ax = plt.subplots(figsize=(4, height_ratio))
     if mode == "front":
         ax.scatter(points_cm[:, 0], points_cm[:, 1], s=1, alpha=0.15)
         ax.plot(spine_cm[:, 0], spine_cm[:, 1], color="red", linewidth=2)
         ax.set_title("Vue frontale")
+        ax.invert_yaxis()  # Correction inversion haut/bas
     if mode == "side":
         ax.scatter(points_cm[:, 2], points_cm[:, 1], s=1, alpha=0.15)
         ax.plot(spine_cm[:, 2], spine_cm[:, 1], color="red", linewidth=2)
         if z_ref is not None:
             ax.plot(z_ref, spine_cm[:, 1], "--", color="black", linewidth=2)
         ax.set_title("Vue sagittale")
+        # Ne pas inverser pour sagittale, plus intuitif
     ax.set_aspect("equal")
-    ax.invert_yaxis()
     ax.grid(True)
     return fig
 
 def save_projection_pdf(fig, filename):
-    """Sauvegarde en PNG pour PDF sans modifier proportions"""
     fig.savefig(filename, bbox_inches="tight")
     plt.close(fig)
 
@@ -139,14 +139,14 @@ if ply_file and st.button("⚙️ Lancer l'analyse"):
     img_front = os.path.join(tmp,"front.png")
     img_side = os.path.join(tmp,"side.png")
 
-    fig_front = render_projection(pts, spine, "front")
-    fig_side = render_projection(pts, spine, "side", z_ref=z_ref, height_ratio=3)  # hauteur réduite
+    fig_front = render_projection(pts, spine, "front", height_ratio=3)  # réduit hauteur
+    fig_side = render_projection(pts, spine, "side", z_ref=z_ref, height_ratio=2.5)  # encore plus compacte
     fig_front.savefig(img_front, bbox_inches="tight")
     fig_side.savefig(img_side, bbox_inches="tight")
 
     col_front, col_side = st.columns([1,1])
-    col_front.image(img_front, caption="Vue frontale", use_column_width=True)
-    col_side.image(img_side, caption="Vue sagittale", use_column_width=True)
+    col_front.image(img_front, caption="Vue frontale", use_column_width=True, output_format="PNG")
+    col_side.image(img_side, caption="Vue sagittale", use_column_width=True, output_format="PNG")
 
     # ==============================
     # RÉSULTATS
