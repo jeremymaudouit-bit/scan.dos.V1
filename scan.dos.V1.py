@@ -49,14 +49,13 @@ def render_projection(points_cm, spine_cm, mode="front", z_ref=None, height_rati
         ax.scatter(points_cm[:, 0], points_cm[:, 1], s=1, alpha=0.15)
         ax.plot(spine_cm[:, 0], spine_cm[:, 1], color="red", linewidth=2)
         ax.set_title("Vue frontale")
-        ax.invert_yaxis()  # Correction inversion haut/bas
+        # Pas d'inversion Y
     if mode == "side":
         ax.scatter(points_cm[:, 2], points_cm[:, 1], s=1, alpha=0.15)
         ax.plot(spine_cm[:, 2], spine_cm[:, 1], color="red", linewidth=2)
         if z_ref is not None:
             ax.plot(z_ref, spine_cm[:, 1], "--", color="black", linewidth=2)
         ax.set_title("Vue sagittale")
-        # Ne pas inverser pour sagittale, plus intuitif
     ax.set_aspect("equal")
     ax.grid(True)
     return fig
@@ -139,8 +138,8 @@ if ply_file and st.button("⚙️ Lancer l'analyse"):
     img_front = os.path.join(tmp,"front.png")
     img_side = os.path.join(tmp,"side.png")
 
-    fig_front = render_projection(pts, spine, "front", height_ratio=3)  # réduit hauteur
-    fig_side = render_projection(pts, spine, "side", z_ref=z_ref, height_ratio=2.5)  # encore plus compacte
+    fig_front = render_projection(pts, spine, "front", height_ratio=2.5)  # réduit hauteur
+    fig_side = render_projection(pts, spine, "side", z_ref=z_ref, height_ratio=2)  # plus compacte
     fig_front.savefig(img_front, bbox_inches="tight")
     fig_side.savefig(img_side, bbox_inches="tight")
 
