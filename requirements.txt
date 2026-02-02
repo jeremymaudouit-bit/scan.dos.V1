@@ -1,6 +1,7 @@
-streamlit>=1.30
+streamlit
 numpy
 scipy
 matplotlib
 reportlab
 plyfile
+Pillow
