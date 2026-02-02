@@ -6,6 +6,7 @@ import tempfile, os
 from datetime import datetime
 from plyfile import PlyData
 from PIL import Image
+import open3d as o3d
 
 # PDF
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Image as PDFImage, Spacer
@@ -22,7 +23,6 @@ st.title("🦴 Analyse rachidienne 3D – Synthèse clinique")
 # UTILS
 # ==============================
 def load_ply_numpy(file):
-    """Lit un PLY (ASCII ou binaire) et renvoie un array Nx3 (X,Y,Z)"""
     plydata = PlyData.read(file)
     vertex = plydata['vertex']
     pts = np.vstack([vertex['x'], vertex['y'], vertex['z']]).T
@@ -62,16 +62,33 @@ def render_projection(points_cm, spine_cm, mode="front", z_ref=None):
     ax.grid(True)
     return fig
 
-def render_raw_scan(points_cm):
-    fig, ax = plt.subplots(figsize=(4, 5))
-    ax.scatter(points_cm[:, 0], points_cm[:, 1], s=1, alpha=0.3, color="gray")
-    ax.set_title("Scan brut")
-    ax.set_aspect("equal")
-    ax.invert_yaxis()
-    ax.grid(False)
-    return fig
+def capture_3d_image(ply_file, spine_cm, filename):
+    """Rendu 3D Open3D en PNG (face + profil)"""
+    pts = load_ply_numpy(ply_file)
+    pts *= 0.1  # mm → cm
+    pts[:,0] -= pts[:,0].mean()
+    pts[:,2] -= pts[:,2].mean()
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    pcd.paint_uniform_color([0.6,0.6,0.6])
 
-def export_pdf(results, img_raw, img_front, img_side):
+    lines = [[i,i+1] for i in range(len(spine_cm)-1)]
+    line_set = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(spine_cm),
+        lines=o3d.utility.Vector2iVector(lines)
+    )
+    line_set.colors = o3d.utility.Vector3dVector([[1,0,0]]*len(lines))
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(visible=False, width=600, height=600)
+    vis.add_geometry(pcd)
+    vis.add_geometry(line_set)
+    vis.poll_events()
+    vis.update_renderer()
+    vis.capture_screen_image(filename)
+    vis.destroy_window()
+
+def export_pdf(results, img_3d, img_front, img_side):
     tmp = tempfile.gettempdir()
     pdf_path = os.path.join(tmp, "rapport_rachis.pdf")
     styles = getSampleStyleSheet()
@@ -79,16 +96,16 @@ def export_pdf(results, img_raw, img_front, img_side):
     story = []
 
     story.append(Paragraph("<b>Rapport d'analyse rachidienne 3D</b>", styles["Title"]))
-    story.append(Spacer(1, 0.4 * cm))
+    story.append(Spacer(1,0.4*cm))
 
-    for k, v in results.items():
+    for k,v in results.items():
         story.append(Paragraph(f"<b>{k}</b> : {v}", styles["Normal"]))
 
-    story.append(Spacer(1, 0.5 * cm))
-    story.append(PDFImage(img_raw, width=5*cm, height=7*cm))
-    story.append(Spacer(1, 0.3 * cm))
+    story.append(Spacer(1,0.5*cm))
+    story.append(PDFImage(img_3d, width=5*cm, height=5*cm))
+    story.append(Spacer(1,0.3*cm))
     story.append(PDFImage(img_front, width=5*cm, height=7*cm))
-    story.append(Spacer(1, 0.3 * cm))
+    story.append(Spacer(1,0.3*cm))
     story.append(PDFImage(img_side, width=5*cm, height=7*cm))
 
     doc.build(story)
@@ -102,11 +119,9 @@ with st.sidebar:
     nom = st.text_input("Nom", "Anonyme")
     prenom = st.text_input("Prénom", "")
     st.divider()
-
     smooth = st.checkbox("Activer le lissage", True)
     smooth_level = st.slider("Intensité lissage", 5, 40, 20)
     k_std = st.slider("Tolérance axe (K × std)", 0.5, 3.0, 1.5)
-
     st.divider()
     ply_file = st.file_uploader("📂 Charger un scan PLY", type=["ply"])
 
@@ -115,70 +130,50 @@ with st.sidebar:
 # ==============================
 if ply_file:
     pts = load_ply_numpy(ply_file)
-    pts *= 0.1  # mm → cm
-
-    # Nettoyage Y
-    y_vals = pts[:, 1]
-    mask = (y_vals > np.percentile(y_vals, 5)) & (y_vals < np.percentile(y_vals, 95))
+    pts *= 0.1
+    mask = (pts[:,1] > np.percentile(pts[:,1],5)) & (pts[:,1] < np.percentile(pts[:,1],95))
     pts = pts[mask]
+    pts[:,0] -= pts[:,0].mean()
+    pts[:,2] -= pts[:,2].mean()
 
-    # Centrage
-    pts[:, 0] -= pts[:, 0].mean()
-    pts[:, 2] -= pts[:, 2].mean()
-
-    # Extraction axe rachidien
-    slices = np.linspace(pts[:, 1].min(), pts[:, 1].max(), 60)
+    slices = np.linspace(pts[:,1].min(), pts[:,1].max(), 60)
     spine = []
-    for i in range(len(slices) - 1):
-        sl = pts[(pts[:, 1] >= slices[i]) & (pts[:, 1] < slices[i + 1])]
-        if len(sl) == 0:
-            continue
-        x_mean, x_std = sl[:, 0].mean(), sl[:, 0].std()
-        sl = sl[(sl[:, 0] > x_mean - k_std * x_std) & (sl[:, 0] < x_mean + k_std * x_std)]
-        if len(sl):
-            spine.append([sl[:, 0].mean(), sl[:, 1].mean(), sl[:, 2].mean()])
-
+    for i in range(len(slices)-1):
+        sl = pts[(pts[:,1]>=slices[i]) & (pts[:,1]<slices[i+1])]
+        if len(sl)==0: continue
+        x_mean,x_std = sl[:,0].mean(), sl[:,0].std()
+        sl = sl[(sl[:,0] > x_mean - k_std*x_std) & (sl[:,0] < x_mean + k_std*x_std)]
+        if len(sl): spine.append([sl[:,0].mean(), sl[:,1].mean(), sl[:,2].mean()])
     spine = np.array(spine)
-    spine = spine[np.argsort(spine[:, 1])]
+    spine = spine[np.argsort(spine[:,1])]
 
     if smooth and len(spine) > 7:
-        win = min(len(spine) // 2 * 2 + 1, smooth_level)
-        spine[:, 0] = savgol_filter(spine[:, 0], win, 3)
-        spine[:, 2] = savgol_filter(spine[:, 2], win, 3)
+        win = min(len(spine)//2*2+1, smooth_level)
+        spine[:,0] = savgol_filter(spine[:,0], win, 3)
+        spine[:,2] = savgol_filter(spine[:,2], win, 3)
 
-    # ==============================
-    # MESURES
-    # ==============================
-    x, y, z = spine.T
-    cobb = compute_cobb_angle(x, y)
+    x,y,z = spine.T
+    cobb = compute_cobb_angle(x,y)
     frontal_dev = np.max(np.abs(x))
     sagittal_dev = np.max(np.abs(z))
     fleche_dorsale, fleche_lombaire, z_ref = compute_sagittal_arrows(spine)
 
-    # ==============================
-    # VISUALISATION
-    # ==============================
-    fig_raw = render_raw_scan(pts)
+    tmp = tempfile.gettempdir()
+    img_3d = os.path.join(tmp,"scan3d.png")
+    img_front = os.path.join(tmp,"front.png")
+    img_side = os.path.join(tmp,"side.png")
+
+    capture_3d_image(ply_file, spine, img_3d)
     fig_front = render_projection(pts, spine, "front")
     fig_side = render_projection(pts, spine, "side", z_ref=z_ref)
-
-    tmp = tempfile.gettempdir()
-    img_raw = os.path.join(tmp, "raw.png")
-    img_front = os.path.join(tmp, "front.png")
-    img_side = os.path.join(tmp, "side.png")
-    fig_raw.savefig(img_raw, bbox_inches="tight")
     fig_front.savefig(img_front, bbox_inches="tight")
     fig_side.savefig(img_side, bbox_inches="tight")
 
-    # Affichage Streamlit réduit
-    col_raw, col_front, col_side = st.columns([1,1,1])
-    col_raw.image(img_raw, caption="Scan brut", use_column_width=True)
+    col_3d, col_front, col_side = st.columns([1,1,1])
+    col_3d.image(img_3d, caption="Scan 3D brut", use_column_width=True)
     col_front.image(img_front, caption="Vue frontale", use_column_width=True)
     col_side.image(img_side, caption="Vue sagittale", use_column_width=True)
 
-    # ==============================
-    # SYNTHÈSE
-    # ==============================
     results = {
         "Patient": f"{prenom} {nom}",
         "Date": datetime.now().strftime("%d/%m/%Y"),
@@ -192,9 +187,6 @@ if ply_file:
     st.subheader("📋 Synthèse clinique")
     st.table(results)
 
-    # ==============================
-    # PDF
-    # ==============================
-    pdf_path = export_pdf(results, img_raw, img_front, img_side)
+    pdf_path = export_pdf(results, img_3d, img_front, img_side)
     with open(pdf_path, "rb") as f:
         st.download_button("📥 Télécharger le rapport PDF", f, "rapport_rachis.pdf")
