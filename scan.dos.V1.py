@@ -38,8 +38,9 @@ def compute_sagittal_arrows(spine_cm):
     z = spine_cm[:, 2]
     z_ref = np.linspace(z[0], z[-1], len(z))
     delta = z - z_ref
-    fleche_dorsale = abs(np.min(delta))
-    fleche_lombaire = abs(np.max(delta))
+    # Correction inversion : max = dorsale, min = lombaire
+    fleche_dorsale = abs(np.max(delta))
+    fleche_lombaire = abs(np.min(delta))
     return fleche_dorsale, fleche_lombaire, z_ref
 
 def render_projection(points_cm, spine_cm, mode="front", z_ref=None, height_ratio=4):
