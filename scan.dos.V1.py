@@ -39,29 +39,33 @@ def load_ply_numpy(file):
     v = plydata['vertex']
     return np.vstack([v['x'], v['y'], v['z']]).T
 
-def compute_sagittal_arrow_lombaire(spine_cm):
+def compute_sagittal_arrow_lombaire_v2(spine_cm):
     """
-    Ligne verticale sur la tangente dorsale (z[0] -> z[-1]).
+    La verticale de référence passe par le point dorsal le plus haut (max de z)
     Flèche dorsale = 0
     Flèche lombaire = distance horizontale (z) de la lordose lombaire à cette verticale
     """
     y = spine_cm[:, 1]
     z = spine_cm[:, 2]
 
-    # Tangente dorsale : ligne entre premier et dernier point
-    z_ref_line = np.linspace(z[0], z[-1], len(z))
+    # Index du point dorsal (max z)
+    idx_dorsal = np.argmax(z)
+    z_dorsal = z[idx_dorsal]
 
-    # Index du point le plus lordotique (min de z)
+    # Verticale de référence : z constante = z_dorsal
+    vertical_z = np.full_like(y, z_dorsal)
+
+    # Index du point lordotique (min z)
     idx_lombaire = np.argmin(z)
     z_lombaire = z[idx_lombaire]
 
     # Flèche dorsale = 0
     fd = 0.0
 
-    # Flèche lombaire = distance verticale entre lordose et tangente
-    fl = abs(z_lombaire - z_ref_line[idx_lombaire])
+    # Flèche lombaire = distance horizontale (z) entre lordose et verticale
+    fl = abs(z_lombaire - z_dorsal)
 
-    return fd, fl, z_ref_line
+    return fd, fl, vertical_z
 
 def export_pdf_pro(patient_info, results, img_f, img_s):
     tmp = tempfile.gettempdir()
@@ -87,7 +91,7 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
                            ('ALIGN', (0,0), (-1,-1), 'CENTER')]))
     story.append(t)
     story.append(Spacer(0.5, 1*cm))
-    story.append(Paragraph("<i>Note : La flèche dorsale est la référence (0 cm). La flèche lombaire est mesurée à partir de cette verticale dorsale.</i>", styles['Italic']))
+    story.append(Paragraph("<i>Note : La flèche dorsale est la référence (0 cm). La flèche lombaire est mesurée depuis cette verticale dorsale.</i>", styles['Italic']))
     story.append(Spacer(1, 1*cm))
     
     img_t = Table([[PDFImage(img_f, width=6*cm, height=9*cm), PDFImage(img_s, width=6*cm, height=9*cm)]])
@@ -134,7 +138,7 @@ if ply_file:
             spine[:,2] = savgol_filter(spine[:,2], smooth_val, 3)
 
         # --- FLÈCHES SAGITTALES ---
-        fd, fl, z_ref = compute_sagittal_arrow_lombaire(spine)
+        fd, fl, vertical_z = compute_sagittal_arrow_lombaire_v2(spine)
         dev_f = np.max(np.abs(spine[:,0]))
 
         # --- GRAPHES (CENTRES) ---
@@ -151,7 +155,7 @@ if ply_file:
         fig_s, ax_s = plt.subplots(figsize=(2.2, 4))
         ax_s.scatter(pts[:,2], pts[:,1], s=0.2, alpha=0.1, color='gray')
         ax_s.plot(spine[:,2], spine[:,1], 'blue', linewidth=1.5)
-        ax_s.plot(z_ref, spine[:,1], 'k--', alpha=0.5, linewidth=1)
+        ax_s.plot(vertical_z, spine[:,1], 'k--', alpha=0.7, linewidth=1)  # verticale dorsale
         ax_s.set_title("Sagittale", fontsize=9)
         ax_s.axis('off')
         fig_s.savefig(img_s_p, bbox_inches='tight', dpi=150)
