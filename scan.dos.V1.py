@@ -1,12 +1,13 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib import cm
+from mpl_toolkits.mplot3d import Axes3D
 from scipy.signal import savgol_filter
 import tempfile, os
 from datetime import datetime
 from plyfile import PlyData
 from PIL import Image
-import open3d as o3d
 
 # PDF
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Image as PDFImage, Spacer
@@ -23,6 +24,7 @@ st.title("🦴 Analyse rachidienne 3D – Synthèse clinique")
 # UTILS
 # ==============================
 def load_ply_numpy(file):
+    """Lit un PLY (ASCII ou binaire) et renvoie un array Nx3 (X,Y,Z)"""
     plydata = PlyData.read(file)
     vertex = plydata['vertex']
     pts = np.vstack([vertex['x'], vertex['y'], vertex['z']]).T
@@ -62,31 +64,19 @@ def render_projection(points_cm, spine_cm, mode="front", z_ref=None):
     ax.grid(True)
     return fig
 
-def capture_3d_image(ply_file, spine_cm, filename):
-    """Rendu 3D Open3D en PNG (face + profil)"""
-    pts = load_ply_numpy(ply_file)
-    pts *= 0.1  # mm → cm
-    pts[:,0] -= pts[:,0].mean()
-    pts[:,2] -= pts[:,2].mean()
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts)
-    pcd.paint_uniform_color([0.6,0.6,0.6])
-
-    lines = [[i,i+1] for i in range(len(spine_cm)-1)]
-    line_set = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(spine_cm),
-        lines=o3d.utility.Vector2iVector(lines)
-    )
-    line_set.colors = o3d.utility.Vector3dVector([[1,0,0]]*len(lines))
-
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(visible=False, width=600, height=600)
-    vis.add_geometry(pcd)
-    vis.add_geometry(line_set)
-    vis.poll_events()
-    vis.update_renderer()
-    vis.capture_screen_image(filename)
-    vis.destroy_window()
+def render_3d_matplotlib(points_cm, spine_cm, filename):
+    """Rendu 3D du scan brut + axe spine"""
+    fig = plt.figure(figsize=(4, 4))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(points_cm[:,0], points_cm[:,1], points_cm[:,2], s=1, alpha=0.3, color='gray')
+    ax.plot(spine_cm[:,0], spine_cm[:,1], spine_cm[:,2], color='red', linewidth=2)
+    ax.view_init(elev=30, azim=60)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    plt.tight_layout()
+    fig.savefig(filename, dpi=150)
+    plt.close(fig)
 
 def export_pdf(results, img_3d, img_front, img_side):
     tmp = tempfile.gettempdir()
@@ -163,7 +153,7 @@ if ply_file:
     img_front = os.path.join(tmp,"front.png")
     img_side = os.path.join(tmp,"side.png")
 
-    capture_3d_image(ply_file, spine, img_3d)
+    render_3d_matplotlib(pts, spine, img_3d)
     fig_front = render_projection(pts, spine, "front")
     fig_side = render_projection(pts, spine, "side", z_ref=z_ref)
     fig_front.savefig(img_front, bbox_inches="tight")
