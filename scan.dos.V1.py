@@ -19,9 +19,16 @@ st.set_page_config(page_title="SpineScan Pro 3D", layout="wide")
 st.markdown("""
     <style>
     .main { background-color: #f8f9fc; }
-    .stMetric { background-color: #ffffff; border: 1px solid #d1d5db; padding: 10px; border-radius: 8px; }
+    .result-box { 
+        background-color: #ffffff; 
+        padding: 20px; 
+        border-radius: 10px; 
+        border: 1px solid #e0e0e0;
+        margin-bottom: 10px;
+    }
+    .value-text { font-size: 1.2rem; font-weight: bold; color: #2c3e50; }
     .stButton>button { background-color: #2c3e50; color: white; width: 100%; border-radius: 8px; font-weight: bold; }
-    .disclaimer { font-size: 0.8rem; color: #666; font-style: italic; }
+    .disclaimer { font-size: 0.85rem; color: #555; font-style: italic; margin-top: 15px; border-left: 3px solid #ccc; padding-left: 10px;}
     </style>
     """, unsafe_allow_html=True)
 
@@ -58,7 +65,6 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
     story.append(Paragraph("<b>BILAN DE SANTÉ RACHIDIENNE 3D</b>", header_s))
     story.append(Spacer(1, 1*cm))
     story.append(Paragraph(f"<b>Patient :</b> {patient_info['prenom']} {patient_info['nom']}", styles['Normal']))
-    story.append(Spacer(1, 0.5*cm))
     
     data = [["Indicateur", "Valeur Mesurée"], 
             ["Angle de Cobb (Est.)", f"{results['cobb']:.1f}°"],
@@ -71,8 +77,8 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
                            ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
                            ('ALIGN', (0,0), (-1,-1), 'CENTER')]))
     story.append(t)
-    story.append(Spacer(1, 0.5*cm))
-    story.append(Paragraph("<i>Note : Angle de Cobb estimé par analyse moyenne des centres de masse.</i>", styles['Italic']))
+    story.append(Spacer(0.5, 1*cm))
+    story.append(Paragraph("<i>Note : L'angle de Cobb est une estimation issue d'une analyse par centre des surfaces de chaque tranche.</i>", styles['Italic']))
     story.append(Spacer(1, 1*cm))
     
     img_t = Table([[PDFImage(img_f, width=6*cm, height=9*cm), PDFImage(img_s, width=6*cm, height=9*cm)]])
@@ -81,10 +87,10 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
     return path
 
 # ==============================
-# INTERFACE SIDEBAR
+# LOGIQUE PRINCIPALE
 # ==============================
 with st.sidebar:
-    st.header("👤 Patient")
+    st.header("👤 Dossier Patient")
     nom = st.text_input("Nom", "DURAND")
     prenom = st.text_input("Prénom", "Jean")
     st.divider()
@@ -93,14 +99,11 @@ with st.sidebar:
     k_std = st.slider("Filtre points", 0.5, 3.0, 1.5)
     ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
 
-# ==============================
-# LOGIQUE PRINCIPALE
-# ==============================
 st.title("🦴 SpineScan Pro")
 
 if ply_file:
     if st.button("⚙️ LANCER L'ANALYSE BIOMÉCANIQUE"):
-        # 1. Traitement
+        # --- CALCULS ---
         pts = load_ply_numpy(ply_file) * 0.1 
         mask = (pts[:,1] > np.percentile(pts[:,1], 5)) & (pts[:,1] < np.percentile(pts[:,1], 95))
         pts = pts[mask]
@@ -111,6 +114,7 @@ if ply_file:
         for i in range(len(slices)-1):
             sl = pts[(pts[:,1]>=slices[i]) & (pts[:,1]<slices[i+1])]
             if len(sl) > 5:
+                # Calcul par centre des surfaces (moyenne x et z de la tranche)
                 mx, sx = sl[:,0].mean(), sl[:,0].std()
                 sl = sl[(sl[:,0] > mx - k_std*sx) & (sl[:,0] < mx + k_std*sx)]
                 if len(sl) > 0:
@@ -125,48 +129,50 @@ if ply_file:
         fd, fl, z_ref = compute_sagittal_arrows(spine)
         dev_f = np.max(np.abs(spine[:,0]))
 
-        # 2. Génération des graphiques (TAILLE RÉDUITE)
+        # --- GRAPHES (CENTRES) ---
         tmp = tempfile.gettempdir()
         img_f_p, img_s_p = os.path.join(tmp, "f.png"), os.path.join(tmp, "s.png")
 
-        fig_f, ax_f = plt.subplots(figsize=(2.5, 4.5))
-        ax_f.scatter(pts[:,0], pts[:,1], s=0.3, alpha=0.1, color='gray')
+        fig_f, ax_f = plt.subplots(figsize=(2.2, 4))
+        ax_f.scatter(pts[:,0], pts[:,1], s=0.2, alpha=0.1, color='gray')
         ax_f.plot(spine[:,0], spine[:,1], 'red', linewidth=1.5)
-        ax_f.set_title("Frontale", fontsize=10)
+        ax_f.set_title("Frontale", fontsize=9)
         ax_f.axis('off')
         fig_f.savefig(img_f_p, bbox_inches='tight', dpi=150)
 
-        fig_s, ax_s = plt.subplots(figsize=(2.5, 4.5))
-        ax_s.scatter(pts[:,2], pts[:,1], s=0.3, alpha=0.1, color='gray')
+        fig_s, ax_s = plt.subplots(figsize=(2.2, 4))
+        ax_s.scatter(pts[:,2], pts[:,1], s=0.2, alpha=0.1, color='gray')
         ax_s.plot(spine[:,2], spine[:,1], 'blue', linewidth=1.5)
         ax_s.plot(z_ref, spine[:,1], 'k--', alpha=0.5, linewidth=1)
-        ax_s.set_title("Sagittale", fontsize=10)
+        ax_s.set_title("Sagittale", fontsize=9)
         ax_s.axis('off')
         fig_s.savefig(img_s_p, bbox_inches='tight', dpi=150)
 
-        # 3. Affichage visuel (Images d'abord pour éviter carrés blancs)
-        st.write("### 📉 Visualisation des courbures")
-        _, col_img1, col_img2, _ = st.columns([1, 1, 1, 1])
-        col_img1.pyplot(fig_f)
-        col_img2.pyplot(fig_s)
+        # --- AFFICHAGE ÉPURÉ (PLUS DE CARRÉS BLANCS) ---
+        st.write("### 📈 Analyse Visuelle")
+        _, v1, v2, _ = st.columns([1, 1, 1, 1])
+        v1.pyplot(fig_f)
+        v2.pyplot(fig_s)
 
-        # 4. Affichage des Mesures (APRES LES GRAPHES)
-        st.divider()
-        st.write("### 📋 Mesures calculées")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Angle de Cobb (Est.)", f"{cobb:.1f}°")
-        m2.metric("Flèche Dorsale", f"{fd:.2f} cm")
-        m3.metric("Flèche Lombaire", f"{fl:.2f} cm")
-        m4.metric("Déviation Lat.", f"{dev_f:.2f} cm")
-        
-        st.markdown('<p class="disclaimer">Note : L\'angle de COBB est une estimation issue d\'une analyse faite par moyenne des centres de masse par tranche.</p>', unsafe_allow_html=True)
+        st.write("### 📋 Synthèse des résultats")
+        st.markdown(f"""
+        <div class="result-box">
+            <p><b>📐 Angle de Cobb (Est.) :</b> <span class="value-text">{cobb:.1f}°</span></p>
+            <p><b>📏 Flèche Dorsale :</b> <span class="value-text">{fd:.2f} cm</span></p>
+            <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
+            <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
+            <div class="disclaimer">
+                Note : L'angle de Cobb est une estimation issue d'une analyse par centre des surfaces de chaque tranche.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        # 5. Export PDF
+        # --- EXPORT ---
         res = {"cobb": cobb, "fd": fd, "fl": fl, "dev_f": dev_f}
         pdf_path = export_pdf_pro({"nom": nom, "prenom": prenom}, res, img_f_p, img_s_p)
         
         st.divider()
         with open(pdf_path, "rb") as f:
-            st.download_button("📥 Télécharger le rapport pro (PDF)", f, f"Bilan_{nom}.pdf")
+            st.download_button("📥 Télécharger le rapport PDF", f, f"Bilan_Spine_{nom}.pdf")
 else:
-    st.info("Veuillez importer un fichier .PLY pour activer l'analyse.")
+    st.info("Veuillez importer un fichier .PLY pour lancer l'analyse.")
