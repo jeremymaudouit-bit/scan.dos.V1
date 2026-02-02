@@ -20,7 +20,7 @@ st.markdown("""
     <style>
     .main { background-color: #f8f9fc; }
     div.stMetric { background-color: #ffffff; border-left: 5px solid #2c3e50; padding: 10px; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    .stButton>button { background-color: #2c3e50; color: white; width: 100%; border-radius: 8px; font-weight: bold; }
+    .stButton>button { background-color: #2c3e50; color: white; width: 100%; border-radius: 8px; font-weight: bold; margin-top: 10px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -56,15 +56,15 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
     story = []
     story.append(Paragraph("<b>BILAN DE SANTÉ RACHIDIENNE 3D</b>", header_s))
     story.append(Spacer(1, 1*cm))
+    story.append(Paragraph(f"Patient: {patient_info['prenom']} {patient_info['nom']}", styles['Normal']))
+    story.append(Spacer(1, 0.5*cm))
     
-    data = [
-        ["Indicateur", "Valeur Mesurée"],
-        ["Angle de Cobb", f"{results['cobb']:.1f}°"],
-        ["Flèche Dorsale", f"{results['fd']:.2f} cm"],
-        ["Flèche Lombaire", f"{results['fl']:.2f} cm"],
-        ["Déviation Latérale", f"{results['dev_f']:.2f} cm"]
-    ]
-    t = Table(data, colWidths=[8*cm, 7*cm])
+    data = [["Indicateur", "Valeur"], 
+            ["Angle de Cobb", f"{results['cobb']:.1f}°"],
+            ["Flèche Dorsale", f"{results['fd']:.2f} cm"],
+            ["Flèche Lombaire", f"{results['fl']:.2f} cm"]]
+    
+    t = Table(data, colWidths=[7*cm, 7*cm])
     t.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor("#2c3e50")),
                            ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
                            ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
@@ -87,83 +87,81 @@ with st.sidebar:
     st.divider()
     st.subheader("🛠 Configuration")
     do_smooth = st.toggle("Lissage des courbes", True)
-    smooth_val = st.slider("Précision (fenêtre)", 5, 51, 25, step=2)
-    k_std = st.slider("Filtrage points aberrants", 0.5, 3.0, 1.5)
+    smooth_val = st.slider("Intensité lissage", 5, 51, 25, step=2)
+    k_std = st.slider("Filtre points", 0.5, 3.0, 1.5)
     st.divider()
-    ply_file = st.file_uploader("Importer Scan 3D (.PLY)", type=["ply"])
-
+    ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
+    
 # ==============================
-# MAIN APP
+# LOGIQUE PRINCIPALE
 # ==============================
 st.title("🦴 SpineScan Pro")
 
 if ply_file:
-    # On affiche le bouton, et tout le reste ne se déclenche que si on clique
+    # Le bouton est le seul élément visible au début
     if st.button("⚙️ LANCER L'ANALYSE BIOMÉCANIQUE"):
-        with st.spinner("Analyse en cours..."):
-            
-            # --- Traitement ---
-            pts = load_ply_numpy(ply_file) * 0.1 
-            mask = (pts[:,1] > np.percentile(pts[:,1], 5)) & (pts[:,1] < np.percentile(pts[:,1], 95))
-            pts = pts[mask]
-            pts[:,0] -= pts[:,0].mean()
-            
-            slices = np.linspace(pts[:,1].min(), pts[:,1].max(), 60)
-            spine = []
-            for i in range(len(slices)-1):
-                sl = pts[(pts[:,1]>=slices[i]) & (pts[:,1]<slices[i+1])]
-                if len(sl) > 5:
-                    mx, sx = sl[:,0].mean(), sl[:,0].std()
-                    sl = sl[(sl[:,0] > mx - k_std*sx) & (sl[:,0] < mx + k_std*sx)]
-                    if len(sl) > 0:
-                        spine.append([sl[:,0].mean(), sl[:,1].mean(), sl[:,2].mean()])
-            
-            spine = np.array(spine)
-            if do_smooth and len(spine) > smooth_val:
-                spine[:,0] = savgol_filter(spine[:,0], smooth_val, 3)
-                spine[:,2] = savgol_filter(spine[:,2], smooth_val, 3)
+        # On encapsule tout l'affichage ICI pour éviter les carrés blancs vides
+        pts = load_ply_numpy(ply_file) * 0.1 
+        mask = (pts[:,1] > np.percentile(pts[:,1], 5)) & (pts[:,1] < np.percentile(pts[:,1], 95))
+        pts = pts[mask]
+        pts[:,0] -= pts[:,0].mean()
+        
+        slices = np.linspace(pts[:,1].min(), pts[:,1].max(), 60)
+        spine = []
+        for i in range(len(slices)-1):
+            sl = pts[(pts[:,1]>=slices[i]) & (pts[:,1]<slices[i+1])]
+            if len(sl) > 5:
+                mx, sx = sl[:,0].mean(), sl[:,0].std()
+                sl = sl[(sl[:,0] > mx - k_std*sx) & (sl[:,0] < mx + k_std*sx)]
+                if len(sl) > 0:
+                    spine.append([sl[:,0].mean(), sl[:,1].mean(), sl[:,2].mean()])
+        
+        spine = np.array(spine)
+        if do_smooth and len(spine) > smooth_val:
+            spine[:,0] = savgol_filter(spine[:,0], smooth_val, 3)
+            spine[:,2] = savgol_filter(spine[:,2], smooth_val, 3)
 
-            cobb = compute_cobb_angle(spine[:,0], spine[:,1])
-            fd, fl, z_ref = compute_sagittal_arrows(spine)
-            dev_front = np.max(np.abs(spine[:,0]))
+        cobb = compute_cobb_angle(spine[:,0], spine[:,1])
+        fd, fl, z_ref = compute_sagittal_arrows(spine)
+        dev_f = np.max(np.abs(spine[:,0]))
 
-            # --- Affichage des Métriques (Seulement après calcul) ---
-            st.subheader("📋 Résultats de la synthèse")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Angle de Cobb", f"{cobb:.1f}°")
-            m2.metric("Flèche Dorsale", f"{fd:.2f} cm")
-            m3.metric("Flèche Lombaire", f"{fl:.2f} cm")
-            m4.metric("Déviation Max", f"{dev_front:.2f} cm")
+        # --- AFFICHAGE DES RÉSULTATS (Dans le bloc IF) ---
+        st.subheader("📋 Synthèse des mesures")
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("Angle de Cobb", f"{cobb:.1f}°")
+        col_m2.metric("Flèche Dorsale", f"{fd:.2f} cm")
+        col_m3.metric("Flèche Lombaire", f"{fl:.2f} cm")
+        col_m4.metric("Déviation Max", f"{dev_f:.2f} cm")
 
-            # --- Graphiques Réduits ---
-            tmp = tempfile.gettempdir()
-            img_f_p, img_s_p = os.path.join(tmp, "f.png"), os.path.join(tmp, "s.png")
+        # --- GRAPHES RÉDUITS ---
+        tmp = tempfile.gettempdir()
+        img_f_p, img_s_p = os.path.join(tmp, "f.png"), os.path.join(tmp, "s.png")
 
-            fig_f, ax_f = plt.subplots(figsize=(3, 6)) # Taille réduite
-            ax_f.scatter(pts[:,0], pts[:,1], s=0.5, alpha=0.1, color='gray')
-            ax_f.plot(spine[:,0], spine[:,1], 'red', linewidth=2)
-            ax_f.set_title("Vue Frontale")
-            fig_f.savefig(img_f_p, bbox_inches='tight')
+        fig_f, ax_f = plt.subplots(figsize=(3, 5))
+        ax_f.scatter(pts[:,0], pts[:,1], s=0.5, alpha=0.1, color='gray')
+        ax_f.plot(spine[:,0], spine[:,1], 'red', linewidth=2)
+        ax_f.set_title("Vue Frontale")
+        fig_f.savefig(img_f_p, bbox_inches='tight')
 
-            fig_s, ax_s = plt.subplots(figsize=(3, 6)) # Taille réduite
-            ax_s.scatter(pts[:,2], pts[:,1], s=0.5, alpha=0.1, color='gray')
-            ax_s.plot(spine[:,2], spine[:,1], 'blue', linewidth=2)
-            ax_s.plot(z_ref, spine[:,1], 'k--', alpha=0.5)
-            ax_s.set_title("Profil Sagittal")
-            fig_s.savefig(img_s_p, bbox_inches='tight')
+        fig_s, ax_s = plt.subplots(figsize=(3, 5))
+        ax_s.scatter(pts[:,2], pts[:,1], s=0.5, alpha=0.1, color='gray')
+        ax_s.plot(spine[:,2], spine[:,1], 'blue', linewidth=2)
+        ax_s.plot(z_ref, spine[:,1], 'k--', alpha=0.5)
+        ax_s.set_title("Profil Sagittal")
+        fig_s.savefig(img_s_p, bbox_inches='tight')
 
-            # Centrage des images via des colonnes (1/4 - 1/4 - 1/4 - 1/4)
-            _, v1, v2, _ = st.columns([0.5, 1, 1, 0.5])
-            v1.pyplot(fig_f)
-            v2.pyplot(fig_s)
+        st.divider()
+        # Mise en page centrée pour les images
+        _, v1, v2, _ = st.columns([0.8, 1, 1, 0.8])
+        v1.pyplot(fig_f)
+        v2.pyplot(fig_s)
 
-            # --- Export PDF ---
-            res_dict = {"cobb": cobb, "fd": fd, "fl": fl, "dev_f": dev_front}
-            pdf_file = export_pdf_pro({"nom": nom, "prenom": prenom}, res_dict, img_f_p, img_s_p)
-            
-            st.divider()
-            col_dl, _ = st.columns([1, 2])
-            with open(pdf_file, "rb") as f:
-                col_dl.download_button("📥 TÉLÉCHARGER LE BILAN PDF", f, f"Bilan_{nom}.pdf")
+        # --- PDF ---
+        res = {"cobb": cobb, "fd": fd, "fl": fl, "dev_f": dev_f}
+        pdf_path = export_pdf_pro({"nom": nom, "prenom": prenom}, res, img_f_p, img_s_p)
+        
+        st.divider()
+        with open(pdf_path, "rb") as f:
+            st.download_button("📥 TÉLÉCHARGER LE BILAN COMPLET (PDF)", f, f"Bilan_{nom}.pdf")
 else:
-    st.info("Veuillez charger un fichier .PLY pour commencer.")
+    st.info("👋 En attente d'un fichier .PLY pour l'analyse.")
