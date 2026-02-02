@@ -5,3 +5,4 @@ matplotlib
 reportlab
 plyfile
 Pillow
+open3d
