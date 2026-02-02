@@ -1,10 +1,10 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.cm as mcm
 from scipy.signal import savgol_filter
 import tempfile, os
 from datetime import datetime
+from plyfile import PlyData
 
 # PDF
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Image, Spacer
@@ -18,8 +18,15 @@ st.set_page_config(page_title="Analyse Rachis 3D IA", layout="wide")
 st.title("🦴 Analyse rachidienne 3D – Synthèse clinique")
 
 # ==============================
-# OUTILS
+# UTILS
 # ==============================
+def load_ply_numpy(file):
+    """Lit un PLY (ASCII ou binaire) et renvoie un array Nx3 (X,Y,Z)"""
+    plydata = PlyData.read(file)
+    vertex = plydata['vertex']
+    pts = np.vstack([vertex['x'], vertex['y'], vertex['z']]).T
+    return pts
+
 def compute_cobb_angle(x, y):
     dy = np.gradient(y)
     dx = np.gradient(x)
@@ -28,8 +35,8 @@ def compute_cobb_angle(x, y):
     a2 = np.arctan(slopes.min())
     return np.degrees(abs(a1 - a2))
 
-
 def compute_sagittal_arrows(spine_cm):
+    """Calcule flèche dorsale et lombaire + verticale de référence"""
     y = spine_cm[:, 1]
     z = spine_cm[:, 2]
     z_ref = np.linspace(z[0], z[-1], len(z))
@@ -38,32 +45,26 @@ def compute_sagittal_arrows(spine_cm):
     fleche_lombaire = abs(np.max(delta))
     return fleche_dorsale, fleche_lombaire, z_ref
 
-
 def render_projection(points_cm, spine_cm, mode="front", z_ref=None):
     fig, ax = plt.subplots(figsize=(5, 7))
-
     if mode == "front":
         ax.scatter(points_cm[:, 0], points_cm[:, 1], s=1, alpha=0.15)
         ax.plot(spine_cm[:, 0], spine_cm[:, 1], color="red", linewidth=2)
         ax.set_title("Vue frontale")
-
     if mode == "side":
         ax.scatter(points_cm[:, 2], points_cm[:, 1], s=1, alpha=0.15)
         ax.plot(spine_cm[:, 2], spine_cm[:, 1], color="red", linewidth=2)
         if z_ref is not None:
             ax.plot(z_ref, spine_cm[:, 1], "--", color="black", linewidth=2)
         ax.set_title("Vue sagittale")
-
     ax.set_aspect("equal")
     ax.invert_yaxis()
     ax.grid(True)
     return fig
 
-
 def export_pdf(results, img_front, img_side):
     tmp = tempfile.gettempdir()
     pdf_path = os.path.join(tmp, "rapport_rachis.pdf")
-
     styles = getSampleStyleSheet()
     doc = SimpleDocTemplate(pdf_path)
     story = []
@@ -83,7 +84,7 @@ def export_pdf(results, img_front, img_side):
     return pdf_path
 
 # ==============================
-# SIDEBAR – PARAMÈTRES
+# SIDEBAR
 # ==============================
 with st.sidebar:
     st.header("👤 Patient")
@@ -102,7 +103,7 @@ with st.sidebar:
 # TRAITEMENT
 # ==============================
 if ply_file:
-    pts = np.loadtxt(ply_file, skiprows=10)[:, :3]  # fallback simple PLY ascii
+    pts = load_ply_numpy(ply_file)
     pts *= 0.1  # mm → cm
 
     # Nettoyage Y
@@ -114,7 +115,7 @@ if ply_file:
     pts[:, 0] -= pts[:, 0].mean()
     pts[:, 2] -= pts[:, 2].mean()
 
-    # Extraction axe
+    # Extraction axe rachidien
     slices = np.linspace(pts[:, 1].min(), pts[:, 1].max(), 60)
     spine = []
     for i in range(len(slices) - 1):
@@ -123,7 +124,8 @@ if ply_file:
             continue
         x_mean, x_std = sl[:, 0].mean(), sl[:, 0].std()
         sl = sl[(sl[:, 0] > x_mean - k_std * x_std) & (sl[:, 0] < x_mean + k_std * x_std)]
-        spine.append([sl[:, 0].mean(), sl[:, 1].mean(), sl[:, 2].mean()])
+        if len(sl):
+            spine.append([sl[:, 0].mean(), sl[:, 1].mean(), sl[:, 2].mean()])
 
     spine = np.array(spine)
     spine = spine[np.argsort(spine[:, 1])]
@@ -143,7 +145,7 @@ if ply_file:
     fleche_dorsale, fleche_lombaire, z_ref = compute_sagittal_arrows(spine)
 
     # ==============================
-    # VISU
+    # VISUALISATION
     # ==============================
     fig_front = render_projection(pts, spine, "front")
     fig_side = render_projection(pts, spine, "side", z_ref=z_ref)
