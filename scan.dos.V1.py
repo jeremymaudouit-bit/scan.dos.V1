@@ -3,7 +3,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
 import tempfile, os
-from datetime import datetime
 from plyfile import PlyData
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Image as PDFImage, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -40,30 +39,26 @@ def load_ply_numpy(file):
     v = plydata['vertex']
     return np.vstack([v['x'], v['y'], v['z']]).T
 
-def compute_sagittal_arrows_v2(spine_cm):
+def compute_sagittal_arrow_lombaire(spine_cm):
     """
-    Mesure des flèches sagittales selon :
-    - Verticale au niveau du point convexe dorsal
-    - Distance de la lordose lombaire jusqu'à la tangente dorsale
+    Ligne verticale sur la tangente dorsale (z[0] -> z[-1]).
+    Flèche dorsale = 0
+    Flèche lombaire = distance horizontale (z) de la lordose lombaire à cette verticale
     """
     y = spine_cm[:, 1]
     z = spine_cm[:, 2]
 
-    # Tangente dorsale : ligne entre z[0] et z[-1]
+    # Tangente dorsale : ligne entre premier et dernier point
     z_ref_line = np.linspace(z[0], z[-1], len(z))
 
-    # Point convexe dorsal (max de z)
-    idx_convexe = np.argmax(z)
-    z_convexe = z[idx_convexe]
-
-    # Point lordose lombaire (min de z)
+    # Index du point le plus lordotique (min de z)
     idx_lombaire = np.argmin(z)
     z_lombaire = z[idx_lombaire]
 
-    # Flèche dorsale = distance verticale du convexe à la tangente
-    fd = abs(z_convexe - z_ref_line[idx_convexe])
+    # Flèche dorsale = 0
+    fd = 0.0
 
-    # Flèche lombaire = distance verticale lordose lombaire à tangente
+    # Flèche lombaire = distance verticale entre lordose et tangente
     fl = abs(z_lombaire - z_ref_line[idx_lombaire])
 
     return fd, fl, z_ref_line
@@ -92,7 +87,7 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
                            ('ALIGN', (0,0), (-1,-1), 'CENTER')]))
     story.append(t)
     story.append(Spacer(0.5, 1*cm))
-    story.append(Paragraph("<i>Note : Les flèches sagittales sont calculées selon la verticale au niveau du point convexe dorsal.</i>", styles['Italic']))
+    story.append(Paragraph("<i>Note : La flèche dorsale est la référence (0 cm). La flèche lombaire est mesurée à partir de cette verticale dorsale.</i>", styles['Italic']))
     story.append(Spacer(1, 1*cm))
     
     img_t = Table([[PDFImage(img_f, width=6*cm, height=9*cm), PDFImage(img_s, width=6*cm, height=9*cm)]])
@@ -139,7 +134,7 @@ if ply_file:
             spine[:,2] = savgol_filter(spine[:,2], smooth_val, 3)
 
         # --- FLÈCHES SAGITTALES ---
-        fd, fl, z_ref = compute_sagittal_arrows_v2(spine)
+        fd, fl, z_ref = compute_sagittal_arrow_lombaire(spine)
         dev_f = np.max(np.abs(spine[:,0]))
 
         # --- GRAPHES (CENTRES) ---
@@ -174,7 +169,7 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Note : La mesure des flèches est calculée selon la verticale au niveau du point convexe dorsal.
+                Note : La flèche dorsale est la référence (0 cm). La flèche lombaire est mesurée depuis cette verticale dorsale.
             </div>
         </div>
         """, unsafe_allow_html=True)
