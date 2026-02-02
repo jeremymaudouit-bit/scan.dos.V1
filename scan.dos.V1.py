@@ -1,15 +1,11 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import cm
-from mpl_toolkits.mplot3d import Axes3D
 from scipy.signal import savgol_filter
 import tempfile, os
 from datetime import datetime
 from plyfile import PlyData
 from PIL import Image
-
-# PDF
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Image as PDFImage, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
@@ -24,7 +20,6 @@ st.title("🦴 Analyse rachidienne 3D – Synthèse clinique")
 # UTILS
 # ==============================
 def load_ply_numpy(file):
-    """Lit un PLY (ASCII ou binaire) et renvoie un array Nx3 (X,Y,Z)"""
     plydata = PlyData.read(file)
     vertex = plydata['vertex']
     pts = np.vstack([vertex['x'], vertex['y'], vertex['z']]).T
@@ -47,8 +42,9 @@ def compute_sagittal_arrows(spine_cm):
     fleche_lombaire = abs(np.max(delta))
     return fleche_dorsale, fleche_lombaire, z_ref
 
-def render_projection(points_cm, spine_cm, mode="front", z_ref=None):
-    fig, ax = plt.subplots(figsize=(4, 5))
+def render_projection(points_cm, spine_cm, mode="front", z_ref=None, height_ratio=5):
+    """Rendu 2D frontale ou sagittale pour Streamlit"""
+    fig, ax = plt.subplots(figsize=(4, height_ratio))
     if mode == "front":
         ax.scatter(points_cm[:, 0], points_cm[:, 1], s=1, alpha=0.15)
         ax.plot(spine_cm[:, 0], spine_cm[:, 1], color="red", linewidth=2)
@@ -64,21 +60,12 @@ def render_projection(points_cm, spine_cm, mode="front", z_ref=None):
     ax.grid(True)
     return fig
 
-def render_3d_matplotlib(points_cm, spine_cm, filename):
-    """Rendu 3D du scan brut + axe spine"""
-    fig = plt.figure(figsize=(4, 4))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(points_cm[:,0], points_cm[:,1], points_cm[:,2], s=1, alpha=0.3, color='gray')
-    ax.plot(spine_cm[:,0], spine_cm[:,1], spine_cm[:,2], color='red', linewidth=2)
-    ax.view_init(elev=30, azim=60)
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-    plt.tight_layout()
-    fig.savefig(filename, dpi=150)
+def save_projection_pdf(fig, filename):
+    """Sauvegarde en PNG pour PDF sans modifier proportions"""
+    fig.savefig(filename, bbox_inches="tight")
     plt.close(fig)
 
-def export_pdf(results, img_3d, img_front, img_side):
+def export_pdf(results, img_front, img_side):
     tmp = tempfile.gettempdir()
     pdf_path = os.path.join(tmp, "rapport_rachis.pdf")
     styles = getSampleStyleSheet()
@@ -92,12 +79,9 @@ def export_pdf(results, img_3d, img_front, img_side):
         story.append(Paragraph(f"<b>{k}</b> : {v}", styles["Normal"]))
 
     story.append(Spacer(1,0.5*cm))
-    story.append(PDFImage(img_3d, width=5*cm, height=5*cm))
+    story.append(PDFImage(img_front, width=12*cm, height=9*cm))
     story.append(Spacer(1,0.3*cm))
-    story.append(PDFImage(img_front, width=5*cm, height=7*cm))
-    story.append(Spacer(1,0.3*cm))
-    story.append(PDFImage(img_side, width=5*cm, height=7*cm))
-
+    story.append(PDFImage(img_side, width=12*cm, height=9*cm))
     doc.build(story)
     return pdf_path
 
@@ -116,9 +100,9 @@ with st.sidebar:
     ply_file = st.file_uploader("📂 Charger un scan PLY", type=["ply"])
 
 # ==============================
-# TRAITEMENT
+# BOUTON ANALYSE
 # ==============================
-if ply_file:
+if ply_file and st.button("⚙️ Lancer l'analyse"):
     pts = load_ply_numpy(ply_file)
     pts *= 0.1
     mask = (pts[:,1] > np.percentile(pts[:,1],5)) & (pts[:,1] < np.percentile(pts[:,1],95))
@@ -148,22 +132,25 @@ if ply_file:
     sagittal_dev = np.max(np.abs(z))
     fleche_dorsale, fleche_lombaire, z_ref = compute_sagittal_arrows(spine)
 
+    # ==============================
+    # RENDER STREAMLIT
+    # ==============================
     tmp = tempfile.gettempdir()
-    img_3d = os.path.join(tmp,"scan3d.png")
     img_front = os.path.join(tmp,"front.png")
     img_side = os.path.join(tmp,"side.png")
 
-    render_3d_matplotlib(pts, spine, img_3d)
     fig_front = render_projection(pts, spine, "front")
-    fig_side = render_projection(pts, spine, "side", z_ref=z_ref)
+    fig_side = render_projection(pts, spine, "side", z_ref=z_ref, height_ratio=3)  # hauteur réduite
     fig_front.savefig(img_front, bbox_inches="tight")
     fig_side.savefig(img_side, bbox_inches="tight")
 
-    col_3d, col_front, col_side = st.columns([1,1,1])
-    col_3d.image(img_3d, caption="Scan 3D brut", use_column_width=True)
+    col_front, col_side = st.columns([1,1])
     col_front.image(img_front, caption="Vue frontale", use_column_width=True)
     col_side.image(img_side, caption="Vue sagittale", use_column_width=True)
 
+    # ==============================
+    # RÉSULTATS
+    # ==============================
     results = {
         "Patient": f"{prenom} {nom}",
         "Date": datetime.now().strftime("%d/%m/%Y"),
@@ -177,6 +164,6 @@ if ply_file:
     st.subheader("📋 Synthèse clinique")
     st.table(results)
 
-    pdf_path = export_pdf(results, img_3d, img_front, img_side)
+    pdf_path = export_pdf(results, img_front, img_side)
     with open(pdf_path, "rb") as f:
         st.download_button("📥 Télécharger le rapport PDF", f, "rapport_rachis.pdf")
