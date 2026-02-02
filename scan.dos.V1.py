@@ -6,7 +6,7 @@ import tempfile, os
 from datetime import datetime
 from plyfile import PlyData
 from PIL import Image
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Image as PDFImage, Spacer
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Image as PDFImage, Spacer, Table
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
 
@@ -43,13 +43,11 @@ def compute_sagittal_arrows(spine_cm):
     return fleche_dorsale, fleche_lombaire, z_ref
 
 def render_projection(points_cm, spine_cm, mode="front", z_ref=None, height_ratio=4):
-    """Rendu 2D frontale ou sagittale pour Streamlit"""
     fig, ax = plt.subplots(figsize=(4, height_ratio))
     if mode == "front":
         ax.scatter(points_cm[:, 0], points_cm[:, 1], s=1, alpha=0.15)
         ax.plot(spine_cm[:, 0], spine_cm[:, 1], color="red", linewidth=2)
         ax.set_title("Vue frontale")
-        # Pas d'inversion Y
     if mode == "side":
         ax.scatter(points_cm[:, 2], points_cm[:, 1], s=1, alpha=0.15)
         ax.plot(spine_cm[:, 2], spine_cm[:, 1], color="red", linewidth=2)
@@ -78,9 +76,13 @@ def export_pdf(results, img_front, img_side):
         story.append(Paragraph(f"<b>{k}</b> : {v}", styles["Normal"]))
 
     story.append(Spacer(1,0.5*cm))
-    story.append(PDFImage(img_front, width=12*cm, height=9*cm))
-    story.append(Spacer(1,0.3*cm))
-    story.append(PDFImage(img_side, width=12*cm, height=9*cm))
+
+    # Table pour mettre images côte à côte
+    table_data = [[PDFImage(img_front, width=8*cm, height=6*cm),
+                   PDFImage(img_side, width=8*cm, height=6*cm)]]
+    table = Table(table_data, hAlign='CENTER')
+    story.append(table)
+
     doc.build(story)
     return pdf_path
 
@@ -138,8 +140,8 @@ if ply_file and st.button("⚙️ Lancer l'analyse"):
     img_front = os.path.join(tmp,"front.png")
     img_side = os.path.join(tmp,"side.png")
 
-    fig_front = render_projection(pts, spine, "front", height_ratio=2.5)  # réduit hauteur
-    fig_side = render_projection(pts, spine, "side", z_ref=z_ref, height_ratio=2)  # plus compacte
+    fig_front = render_projection(pts, spine, "front", height_ratio=2.5)
+    fig_side = render_projection(pts, spine, "side", z_ref=z_ref, height_ratio=2)
     fig_front.savefig(img_front, bbox_inches="tight")
     fig_side.savefig(img_side, bbox_inches="tight")
 
