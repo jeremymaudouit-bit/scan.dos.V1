@@ -1,39 +1,41 @@
-import streamlit as st
-import numpy as np
+# ================= OPEN3D CLOUD SAFE =================
 import os
 os.environ["OPEN3D_CPU_RENDERING"] = "true"
 
-import open3d as o3d
-
+# ================= IMPORTS =================
+import streamlit as st
+import numpy as np
 import open3d as o3d
 import matplotlib.pyplot as plt
 import matplotlib.cm as mcm
 from scipy.signal import savgol_filter
 import tempfile
-import os
 from datetime import datetime
 
-# PDF
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Image, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
 
-# ================= CONFIG STREAMLIT =================
-st.set_page_config(page_title="Analyse Rachidienne 3D", layout="wide")
+# ================= STREAMLIT CONFIG =================
+st.set_page_config(
+    page_title="Analyse Rachidienne 3D",
+    layout="wide"
+)
 
-st.title("🦴 Analyse Rachidienne 3D IA")
+st.title("🦴 Analyse Rachidienne 3D – IA")
 st.markdown("---")
 
 # ================= SIDEBAR =================
 with st.sidebar:
-    st.header("👤 Dossier Patient")
+    st.header("👤 Patient")
     nom = st.text_input("Nom", value="Anonyme")
     prenom = st.text_input("Prénom", value="")
-    st.divider()
 
-    st.header("⚙️ Paramètres d'analyse")
+    st.divider()
+    st.header("⚙️ Paramètres")
+
     smooth_enabled = st.checkbox("Activer le lissage", value=True)
-    smooth_level = st.slider("Niveau de lissage", 3, 50, 30)
+    smooth_level = st.slider("Niveau de lissage", 5, 50, 30)
     k_std = st.slider("Tolérance filtrage frontal (K×std)", 0.5, 3.0, 1.5, 0.1)
 
 # ================= OUTILS =================
@@ -48,6 +50,7 @@ def compute_cobb_angle(x, y):
 def capture_3d_image(pcd, spine, filename):
     vis = o3d.visualization.Visualizer()
     vis.create_window(visible=False)
+
     vis.add_geometry(pcd)
 
     lines = [[i, i + 1] for i in range(len(spine) - 1)]
@@ -65,14 +68,20 @@ def capture_3d_image(pcd, spine, filename):
 
 def generate_pdf(data, img_graphes, img_3d):
     filename = f"Rapport_Rachis_{data['Nom']}.pdf"
-    doc = SimpleDocTemplate(filename)
     styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(filename)
     story = []
 
     story.append(Paragraph("<b>Rapport d'analyse rachidienne 3D</b>", styles["Title"]))
     story.append(Spacer(1, 0.4 * cm))
-    story.append(Paragraph(f"<b>Patient :</b> {data['Prenom']} {data['Nom']}", styles["Normal"]))
-    story.append(Paragraph(f"<b>Date :</b> {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles["Normal"]))
+
+    story.append(Paragraph(
+        f"<b>Patient :</b> {data['Prenom']} {data['Nom']}", styles["Normal"]
+    ))
+    story.append(Paragraph(
+        f"<b>Date :</b> {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles["Normal"]
+    ))
+
     story.append(Spacer(1, 0.3 * cm))
 
     for k, v in data.items():
@@ -95,26 +104,30 @@ if uploaded_file:
     tmp_ply.write(uploaded_file.read())
     tmp_ply.close()
 
-    if st.button("⚙️ LANCER L'ANALYSE RACHIDIENNE", use_container_width=True):
+    if st.button("⚙️ LANCER L'ANALYSE", use_container_width=True):
         with st.spinner("Analyse 3D de la colonne vertébrale..."):
 
+            # ---------- Chargement ----------
             pcd = o3d.io.read_point_cloud(tmp_ply.name)
+
+            # Sécurité cloud : sous-échantillonnage
+            pcd = pcd.voxel_down_sample(voxel_size=2.0)
+
             pts = np.asarray(pcd.points)
 
-            # Nettoyage Y
+            # ---------- Nettoyage ----------
             y_vals = pts[:, 1]
             mask = (y_vals > np.percentile(y_vals, 5)) & (y_vals < np.percentile(y_vals, 95))
             pts = pts[mask]
 
-            # Centrage
             pts[:, 0] -= pts[:, 0].mean()
             pts[:, 2] -= pts[:, 2].mean()
 
-            # Couleurs profondeur
+            # ---------- Couleurs ----------
             z_norm = (pts[:, 2] - pts[:, 2].min()) / (pts[:, 2].ptp() + 1e-6)
             pcd.colors = o3d.utility.Vector3dVector(mcm.viridis(z_norm)[:, :3])
 
-            # Extraction axe central
+            # ---------- Axe rachidien ----------
             slices = np.linspace(pts[:, 1].min(), pts[:, 1].max(), 50)
             spine = []
 
@@ -122,18 +135,26 @@ if uploaded_file:
                 sl = pts[(pts[:, 1] >= slices[i]) & (pts[:, 1] < slices[i + 1])]
                 if len(sl) == 0:
                     continue
-                x_mean, x_std = sl[:, 0].mean(), sl[:, 0].std()
+
+                x_mean = sl[:, 0].mean()
+                x_std = sl[:, 0].std()
                 mask_x = (sl[:, 0] > x_mean - k_std * x_std) & (sl[:, 0] < x_mean + k_std * x_std)
                 sl = sl[mask_x]
+
                 if len(sl) == 0:
                     continue
-                spine.append([sl[:, 0].mean(), sl[:, 1].mean(), sl[:, 2].mean()])
+
+                spine.append([
+                    sl[:, 0].mean(),
+                    sl[:, 1].mean(),
+                    sl[:, 2].mean()
+                ])
 
             spine = np.array(spine)
             spine = spine[np.argsort(spine[:, 1])]
 
-            # Lissage
-            if smooth_enabled and len(spine) > 5:
+            # ---------- Lissage ----------
+            if smooth_enabled and len(spine) > 7:
                 window = min(len(spine) // 2 * 2 + 1, smooth_level * 2 + 1)
                 spine[:, 0] = savgol_filter(spine[:, 0], window, 3)
                 spine[:, 2] = savgol_filter(spine[:, 2], window, 3)
@@ -141,11 +162,12 @@ if uploaded_file:
             spine_cm = spine / 10
             x, y, z = spine_cm.T
 
+            # ---------- Indicateurs ----------
             cobb = compute_cobb_angle(x, y)
             frontal_dev = np.max(np.abs(x))
             sagittal_dev = np.max(np.abs(z))
 
-            # Graphiques
+            # ---------- Graphiques ----------
             tmpdir = tempfile.gettempdir()
             img_graphes = os.path.join(tmpdir, "graphes.png")
             img_3d = os.path.join(tmpdir, "spine3d.png")
@@ -165,9 +187,11 @@ if uploaded_file:
             plt.savefig(img_graphes)
             st.pyplot(fig)
 
+            # ---------- Image 3D ----------
             capture_3d_image(pcd, spine, img_3d)
             st.image(img_3d, caption="Reconstruction 3D rachidienne")
 
+            # ---------- Résultats ----------
             results = {
                 "Nom": nom,
                 "Prenom": prenom,
@@ -182,6 +206,7 @@ if uploaded_file:
             st.subheader("📊 Résultats cliniques")
             st.table(results)
 
+            # ---------- PDF ----------
             pdf_path = generate_pdf(results, img_graphes, img_3d)
             with open(pdf_path, "rb") as f:
                 st.download_button(
@@ -191,4 +216,3 @@ if uploaded_file:
                     mime="application/pdf",
                     use_container_width=True
                 )
-
