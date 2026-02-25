@@ -117,7 +117,7 @@ def median_filter_1d(a, k):
         out[i] = np.median(a[lo:hi])
     return out
 
-def smooth_spine(spine, window=61, strong=True, median_k=9):
+def smooth_spine(spine, window=81, strong=True, median_k=11):
     if spine.shape[0] < 7:
         return spine
     out = spine.copy()
@@ -147,116 +147,76 @@ def smooth_spine(spine, window=61, strong=True, median_k=9):
     return out
 
 # ==============================
-# SURFACE-WEIGHT CENTER (anti densité)
+# FRONTAL ROBUSTE : correction rotation + extraction stable
 # ==============================
-def symmetry_center_1d(xc, zc):
-    """Trouve c qui minimise l'asymétrie du profil z(x)."""
-    if len(xc) < 8:
-        return float(np.median(xc))
-    xmin, xmax = float(np.min(xc)), float(np.max(xc))
-    span = xmax - xmin
-    a = xmin + 0.12 * span
-    b = xmax - 0.12 * span
-    if b <= a:
-        return float(np.median(xc))
-
-    candidates = np.linspace(a, b, 31)
-    best_c, best_cost = None, np.inf
-    for c in candidates:
-        umax = min(c - xmin, xmax - c)
-        if umax <= 0:
-            continue
-        us = np.linspace(0, umax, 25)
-        zL = np.interp(c - us, xc, zc)
-        zR = np.interp(c + us, xc, zc)
-        cost = float(np.mean(np.abs(zR - zL)))
-        if cost < best_cost:
-            best_cost, best_c = cost, c
-    return float(best_c if best_c is not None else np.median(xc))
-
-def extract_midline_surface(pts, cell_cm=0.4, remove_shoulders=True,
-                           z_surface_percentile=95, keep_top_x_profile=35):
+def extract_midline_rot_corrected(pts, remove_shoulders=True):
     """
-    Extraction 100% surface-weight:
-    - bins en X (cell_cm)
-    - par bin: z_surface = percentile élevé (dos)
-    - centre = symétrie du profil z(x)
-    -> pas de biais densité
+    1) Estime rotation du tronc dans le plan XZ (PCA sur zone centrale)
+    2) Ré-aligne le nuage
+    3) Extrait l'axe médian par tranches (robuste)
+    4) Remet la courbe dans le repère original
     """
+
+    # zone centrale pour estimer rotation (évite épaules/hanche)
     y = pts[:, 1]
+    mid_mask = (y > np.percentile(y, 30)) & (y < np.percentile(y, 70))
+    pts_mid = pts[mid_mask]
+    if pts_mid.shape[0] < 200:
+        pts_mid = pts
+
+    XZ = pts_mid[:, [0, 2]]
+    XZ = XZ - np.mean(XZ, axis=0)
+
+    # PCA via SVD
+    _, _, Vt = np.linalg.svd(XZ, full_matrices=False)
+    # angle de l'axe principal dans XZ
+    angle = float(np.arctan2(Vt[0, 1], Vt[0, 0]))
+
+    # rotation inverse (on "redresse")
+    c, s = np.cos(-angle), np.sin(-angle)
+    R = np.array([[c, -s],
+                  [s,  c]], dtype=float)
+
+    XZ_rot = pts[:, [0, 2]] @ R.T
+    pts_rot = np.column_stack([XZ_rot[:, 0], pts[:, 1], XZ_rot[:, 1]])
+
+    # extraction par tranches Y dans repère redressé
+    y = pts_rot[:, 1]
     y0 = np.percentile(y, 10)
     y1 = np.percentile(y, 92)
     slices = np.linspace(y0, y1, 120)
 
     spine = []
-    prev_x0 = None
+    prev_x = None
 
     for i in range(len(slices) - 1):
-        sl = pts[(y >= slices[i]) & (y < slices[i + 1])]
-        if sl.shape[0] < 40:
+        sl = pts_rot[(y >= slices[i]) & (y < slices[i + 1])]
+        if sl.shape[0] < 30:
             continue
 
-        # centrage local (sur points de la tranche) pour stabiliser le profil
-        x_local = sl[:, 0] - np.median(sl[:, 0])
-        z = sl[:, 2]
+        xvals = sl[:, 0]
+        zvals = sl[:, 2]
 
-        # option épaules: on ne garde que le "dos" (z haut) dans la tranche
+        # Option épaules: ne garder que le "dos" (z haut) dans la tranche
         if remove_shoulders:
-            thr = np.percentile(z, 80)
-            m = z >= thr
-            if np.count_nonzero(m) > 20:
-                x_local = x_local[m]
-                z = z[m]
+            thr = np.percentile(zvals, 80)
+            m = zvals >= thr
+            if np.count_nonzero(m) > 15:
+                xvals = xvals[m]
+                zvals = zvals[m]
 
-        if x_local.size < 30:
+        if xvals.size < 8:
             continue
 
-        # bins X (surface)
-        xmin, xmax = np.percentile(x_local, [2, 98])
-        if xmax - xmin < 1e-6:
-            continue
-
-        nbins = max(25, int(np.ceil((xmax - xmin) / cell_cm)))
-        edges = np.linspace(xmin, xmax, nbins + 1)
-
-        xc, zc = [], []
-        for b in range(nbins):
-            m = (x_local >= edges[b]) & (x_local < edges[b + 1])
-            if np.count_nonzero(m) < 4:
-                continue
-            xc.append(0.5 * (edges[b] + edges[b + 1]))
-            zc.append(float(np.percentile(z[m], z_surface_percentile)))  # surface dos
-
-        if len(xc) < 10:
-            continue
-
-        xc = np.array(xc, dtype=float)
-        zc = np.array(zc, dtype=float)
-
-        # garder seulement le "dos" du profil (évite flancs / trous)
-        thr = np.percentile(zc, 100 - keep_top_x_profile)
-        sel = zc >= thr
-        if np.count_nonzero(sel) >= 10:
-            xc = xc[sel]
-            zc = zc[sel]
-
-        # ordonner + mini lissage du profil
-        o = np.argsort(xc)
-        xc = xc[o]
-        zc = zc[o]
-        if len(zc) >= 11:
-            w = 9
-            if w < len(zc):
-                zc = savgol_filter(zc, w, 2)
-
-        x0 = symmetry_center_1d(xc, zc)
+        # centre robuste insensible à densité: moyenne des quantiles (20-80)
+        x0 = float(0.5 * (np.percentile(xvals, 20) + np.percentile(xvals, 80)))
         y_mid = float(np.mean(sl[:, 1]))
-        z0 = float(np.percentile(z, 90))
+        z0 = float(np.percentile(zvals, 90))
 
-        # continuité douce (évite gros saut haut du tronc)
-        if prev_x0 is not None and abs(x0 - prev_x0) > 1.2:
-            x0 = prev_x0
-        prev_x0 = x0
+        # continuité douce
+        if prev_x is not None and abs(x0 - prev_x) > 1.2:
+            x0 = prev_x
+        prev_x = x0
 
         spine.append([x0, y_mid, z0])
 
@@ -265,6 +225,12 @@ def extract_midline_surface(pts, cell_cm=0.4, remove_shoulders=True,
 
     spine = np.array(spine, dtype=float)
     spine = spine[np.argsort(spine[:, 1])]
+
+    # remettre dans repère original (rotation inverse)
+    XZ_sp = spine[:, [0, 2]] @ R  # R^-1 = R.T, ici on a utilisé R.T plus haut, donc retour via R
+    spine[:, 0] = XZ_sp[:, 0]
+    spine[:, 2] = XZ_sp[:, 1]
+
     return spine
 
 # ==============================
@@ -278,14 +244,10 @@ with st.sidebar:
 
     remove_shoulders = st.toggle("Supprimer épaules (haut)", True)
 
-    st.subheader("🧩 Surface (anti densité)")
-    # un seul réglage “surface” facile
-    cell_mm = st.slider("Résolution surface (mm)", 2, 10, 4)
-
     st.subheader("🧽 Lissage")
     do_smooth = st.toggle("Activer", True)
     strong_smooth = st.toggle("Lissage fort (anti-pics)", True)
-    smooth_window = st.slider("Fenêtre lissage", 5, 151, 81, step=2)
+    smooth_window = st.slider("Fenêtre lissage", 5, 151, 91, step=2)
     median_k = st.slider("Anti-pics (médian)", 3, 31, 11, step=2)
 
     st.divider()
@@ -302,21 +264,13 @@ if ply_file:
         mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
         pts = pts[mask]
 
-        # --- centrage X global ---
+        # --- centrage X global (juste pour l'affichage stable) ---
         pts[:, 0] -= np.median(pts[:, 0])
 
-        # --- extraction axe (SURFACE-WEIGHT) ---
-        cell_cm = float(cell_mm) / 10.0
-        spine = extract_midline_surface(
-            pts,
-            cell_cm=cell_cm,
-            remove_shoulders=remove_shoulders,
-            z_surface_percentile=95,
-            keep_top_x_profile=35
-        )
-
+        # --- extraction axe robuste + correction rotation ---
+        spine = extract_midline_rot_corrected(pts, remove_shoulders=remove_shoulders)
         if spine.shape[0] < 10:
-            st.error("Extraction insuffisante : augmente la résolution surface (mm) ou désactive suppression épaules.")
+            st.error("Extraction insuffisante. Essaie de désactiver 'Supprimer épaules' ou améliore le scan.")
             st.stop()
 
         # --- lissage ---
@@ -360,8 +314,8 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Frontal : extraction <b>surface-weight</b> (bins X) → indépendante de la densité du scan.
-                Résolution surface : {cell_mm} mm.
+                Correction clé : redressement automatique du tronc (rotation XZ) avant extraction.
+                Centre robuste : moyenne quantiles 20–80 (peu sensible à la densité).
             </div>
         </div>
         """, unsafe_allow_html=True)
