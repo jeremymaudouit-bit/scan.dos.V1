@@ -88,11 +88,14 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
 def compute_sagittal_arrow_lombaire_v2(spine_cm):
     y = spine_cm[:, 1]
     z = spine_cm[:, 2]
+
     idx_dorsal = int(np.argmax(z))
     z_dorsal = float(z[idx_dorsal])
     vertical_z = np.full_like(y, z_dorsal)
+
     idx_lombaire = int(np.argmin(z))
     z_lombaire = float(z[idx_lombaire])
+
     fd = 0.0
     fl = float(abs(z_lombaire - z_dorsal))
     return fd, fl, vertical_z
@@ -101,7 +104,6 @@ def compute_sagittal_arrow_lombaire_v2(spine_cm):
 # STRONG SMOOTHING (anti zigzag)
 # ==============================
 def median_filter_1d(a, k):
-    """Filtre médian 1D sans nouvelle lib. k impair."""
     a = np.asarray(a, dtype=float)
     n = a.size
     if n == 0:
@@ -120,14 +122,8 @@ def median_filter_1d(a, k):
     return out
 
 def smooth_spine(spine, smooth_val=61, poly=3, strong=True, median_k=9, auto_window=True):
-    """
-    Lissage propre:
-      - strong: médian (anti pics) + SavGol
-      - auto_window: fenêtre basée sur la longueur (recommandé)
-    """
     if spine.shape[0] < 7:
         return spine
-
     n = spine.shape[0]
     out = spine.copy()
 
@@ -163,6 +159,7 @@ def smooth_spine(spine, smooth_val=61, poly=3, strong=True, median_k=9, auto_win
 
 # =========================================================
 # FRONTAL FROM SURFACE (x,y)->z_surface (anti densité)
+# + recadrage tronc + continuité anti-sauts (épaules)
 # =========================================================
 def build_dorsal_surface_grid(pts_cm, cell_cm=0.4, z_percentile=95):
     x = pts_cm[:, 0]
@@ -225,7 +222,22 @@ def symmetry_center_1d(xc, zc):
             best_cost, best_c = cost, c
     return float(best_c if best_c is not None else np.median(xc))
 
-def frontal_centerline_from_surface(pts_cm, cell_cm=0.4, z_cell_percentile=95, keep_top_percent_rows=35):
+def frontal_centerline_from_surface(
+    pts_cm,
+    cell_cm=0.4,
+    z_cell_percentile=95,
+    keep_top_percent_rows=35,
+    trunk_crop=(12, 92),        # ✅ recadrage tronc (évite épaules/nuque)
+    max_jump_cm=0.8             # ✅ continuité anti-sauts (épaules)
+):
+    # recadrage Y (tronc)
+    y = pts_cm[:, 1]
+    y0 = np.percentile(y, trunk_crop[0])
+    y1 = np.percentile(y, trunk_crop[1])
+    pts_cm = pts_cm[(y >= y0) & (y <= y1)]
+    if pts_cm.shape[0] < 50:
+        return np.empty((0, 3), dtype=float)
+
     grid = build_dorsal_surface_grid(pts_cm, cell_cm=cell_cm, z_percentile=z_cell_percentile)
     if grid is None:
         return np.empty((0, 3), dtype=float)
@@ -233,6 +245,8 @@ def frontal_centerline_from_surface(pts_cm, cell_cm=0.4, z_cell_percentile=95, k
     ny, nx = Z.shape
 
     spine = []
+    prev_x0 = None
+
     for j in range(ny):
         row = Z[j, :]
         ok = np.isfinite(row)
@@ -258,9 +272,16 @@ def frontal_centerline_from_surface(pts_cm, cell_cm=0.4, z_cell_percentile=95, k
                 z_row = savgol_filter(z_row, w, 2)
 
         x0 = symmetry_center_1d(x_row, z_row)
-        y0 = float(yc[j])
+        y_line = float(yc[j])
         z0 = float(np.nanpercentile(row, 90))
-        spine.append([x0, y0, z0])
+
+        # continuité (anti crochet haut)
+        if prev_x0 is not None and abs(x0 - prev_x0) > max_jump_cm:
+            # on ignore la ligne instable
+            continue
+        prev_x0 = x0
+
+        spine.append([x0, y_line, z0])
 
     spine = np.array(spine, dtype=float)
     if spine.shape[0] == 0:
@@ -269,7 +290,7 @@ def frontal_centerline_from_surface(pts_cm, cell_cm=0.4, z_cell_percentile=95, k
     return spine
 
 # ==============================
-# SIMPLE PRESETS (no headache)
+# SIMPLE PRESETS
 # ==============================
 def params_from_quality(quality: str):
     if quality == "Rapide":
@@ -293,16 +314,18 @@ with st.sidebar:
     do_smooth = st.toggle("Activer lissage", True)
     strong_smooth = st.toggle("Lissage fort (recommandé)", True)
     auto_window = st.toggle("Fenêtre auto (recommandé)", True)
-
     smooth_val = st.slider("Échelle lissage (fenêtre)", 9, 151, 61, step=2)
-    median_k = st.slider("Anti-pics (médian)", 3, 31, 9, step=2)
+    median_k = st.slider("Anti-pics (médian)", 3, 31, 11, step=2)
 
-    with st.expander("⚙️ Réglages avancés (surface)"):
+    with st.expander("⚙️ Réglages avancés (optionnel)"):
         adv_on = st.toggle("Activer réglages avancés", False)
         if adv_on:
             cell_mm_adv = st.slider("Taille cellule surface (mm)", 2, 10, 4)
             z_cell_percentile_adv = st.slider("Percentile z / cellule", 85, 99, 95)
             top_row_adv = st.slider("Top % dos / ligne y", 10, 60, 35)
+            trunk_low = st.slider("Recadrage bas tronc (%)", 0, 30, 12)
+            trunk_high = st.slider("Recadrage haut tronc (%)", 70, 100, 92)
+            max_jump_cm = st.slider("Anti-saut max (cm)", 0.2, 2.0, 0.8, 0.1)
 
     ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
 
@@ -316,7 +339,7 @@ if ply_file:
         # Hypothèse identique à ton code d'origine : PLY en mm -> cm
         pts = pts * 0.1
 
-        # --- nettoyage Y ---
+        # --- nettoyage Y (global) ---
         mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
         pts = pts[mask]
 
@@ -329,18 +352,25 @@ if ply_file:
         z_cell_percentile = p["z_cell_percentile"]
         top_row = p["top_row"]
 
+        trunk_crop = (12, 92)
+        jump_cm = 0.8
+
         if adv_on:
             cell_mm = cell_mm_adv
             z_cell_percentile = z_cell_percentile_adv
             top_row = top_row_adv
+            trunk_crop = (trunk_low, trunk_high)
+            jump_cm = max_jump_cm
 
-        # --- extraction frontal par surface ---
+        # --- extraction frontal par surface + tronc + continuité ---
         cell_cm = float(cell_mm) / 10.0
         spine = frontal_centerline_from_surface(
             pts_cm=pts,
             cell_cm=cell_cm,
             z_cell_percentile=z_cell_percentile,
-            keep_top_percent_rows=top_row
+            keep_top_percent_rows=top_row,
+            trunk_crop=trunk_crop,
+            max_jump_cm=jump_cm
         )
 
         if spine.shape[0] < 12:
@@ -394,8 +424,7 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Plan frontal : moyenne de <b>surface</b> (grille) + centre par <b>symétrie</b>.
-                Lissage : médian (anti-pics) + Savitzky-Golay (fenêtre auto optionnelle).
+                Correction du “crochet haut” : recadrage automatique du tronc + continuité anti-sauts (épaules/omoplates) + lissage fort.
                 Preset “{quality}”.
             </div>
         </div>
