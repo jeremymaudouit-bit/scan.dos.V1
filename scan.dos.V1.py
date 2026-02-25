@@ -147,74 +147,110 @@ def smooth_spine(spine, window=81, strong=True, median_k=11):
     return out
 
 # ==============================
-# FRONTAL ROBUSTE : correction rotation + extraction stable
+# ROTATION CORRECTION (XZ) + AXE PAR COURBURE
 # ==============================
-def extract_midline_rot_corrected(pts, remove_shoulders=True):
-    """
-    1) Estime rotation du tronc dans le plan XZ (PCA sur zone centrale)
-    2) Ré-aligne le nuage
-    3) Extrait l'axe médian par tranches (robuste)
-    4) Remet la courbe dans le repère original
-    """
-
-    # zone centrale pour estimer rotation (évite épaules/hanche)
+def estimate_rotation_xz(pts):
+    """Estime une rotation globale autour de Y (plan XZ) pour redresser le tronc."""
     y = pts[:, 1]
-    mid_mask = (y > np.percentile(y, 30)) & (y < np.percentile(y, 70))
-    pts_mid = pts[mid_mask]
-    if pts_mid.shape[0] < 200:
-        pts_mid = pts
+    mid = (y > np.percentile(y, 30)) & (y < np.percentile(y, 70))
+    pts_mid = pts[mid] if np.count_nonzero(mid) > 200 else pts
 
     XZ = pts_mid[:, [0, 2]]
     XZ = XZ - np.mean(XZ, axis=0)
 
-    # PCA via SVD
     _, _, Vt = np.linalg.svd(XZ, full_matrices=False)
-    # angle de l'axe principal dans XZ
     angle = float(np.arctan2(Vt[0, 1], Vt[0, 0]))
-
-    # rotation inverse (on "redresse")
     c, s = np.cos(-angle), np.sin(-angle)
     R = np.array([[c, -s],
                   [s,  c]], dtype=float)
+    return R
 
+def apply_rotation_xz(pts, R):
     XZ_rot = pts[:, [0, 2]] @ R.T
-    pts_rot = np.column_stack([XZ_rot[:, 0], pts[:, 1], XZ_rot[:, 1]])
+    return np.column_stack([XZ_rot[:, 0], pts[:, 1], XZ_rot[:, 1]])
 
-    # extraction par tranches Y dans repère redressé
-    y = pts_rot[:, 1]
+def extract_spine_by_curvature(pts, remove_shoulders=True):
+    """
+    Extraction type "ligne des épineuses":
+    - corrige rotation XZ
+    - par tranche Y: construit un profil z(x) (dos)
+    - trouve le point le plus concave (min dérivée seconde)
+    -> beaucoup moins influencé par muscles/densité
+    """
+
+    # 1) redresser
+    R = estimate_rotation_xz(pts)
+    pts_r = apply_rotation_xz(pts, R)
+
+    y = pts_r[:, 1]
     y0 = np.percentile(y, 10)
     y1 = np.percentile(y, 92)
-    slices = np.linspace(y0, y1, 120)
+    slices = np.linspace(y0, y1, 140)
 
     spine = []
     prev_x = None
 
     for i in range(len(slices) - 1):
-        sl = pts_rot[(y >= slices[i]) & (y < slices[i + 1])]
-        if sl.shape[0] < 30:
+        sl = pts_r[(y >= slices[i]) & (y < slices[i + 1])]
+        if sl.shape[0] < 40:
             continue
 
-        xvals = sl[:, 0]
-        zvals = sl[:, 2]
+        x = sl[:, 0]
+        z = sl[:, 2]
 
-        # Option épaules: ne garder que le "dos" (z haut) dans la tranche
+        # option épaules / relief haut: ne garder que la zone dorsale (z haut)
         if remove_shoulders:
-            thr = np.percentile(zvals, 80)
-            m = zvals >= thr
-            if np.count_nonzero(m) > 15:
-                xvals = xvals[m]
-                zvals = zvals[m]
+            thr = np.percentile(z, 80)
+            m = z >= thr
+            if np.count_nonzero(m) > 20:
+                x = x[m]
+                z = z[m]
 
-        if xvals.size < 8:
+        if x.size < 20:
             continue
 
-        # centre robuste insensible à densité: moyenne des quantiles (20-80)
-        x0 = float(0.5 * (np.percentile(xvals, 20) + np.percentile(xvals, 80)))
-        y_mid = float(np.mean(sl[:, 1]))
-        z0 = float(np.percentile(zvals, 90))
+        # profil z(x) : regrouper par bins en x pour neutraliser densité
+        xmin, xmax = np.percentile(x, [2, 98])
+        if xmax - xmin < 1e-6:
+            continue
 
-        # continuité douce
-        if prev_x is not None and abs(x0 - prev_x) > 1.2:
+        cell_cm = 0.4  # 4 mm fixe (robuste)
+        nbins = max(25, int(np.ceil((xmax - xmin) / cell_cm)))
+        edges = np.linspace(xmin, xmax, nbins + 1)
+
+        xc, zc = [], []
+        for b in range(nbins):
+            mb = (x >= edges[b]) & (x < edges[b + 1])
+            if np.count_nonzero(mb) < 4:
+                continue
+            xc.append(0.5 * (edges[b] + edges[b + 1]))
+            zc.append(float(np.percentile(z[mb], 95)))
+
+        if len(xc) < 12:
+            continue
+
+        xc = np.array(xc, dtype=float)
+        zc = np.array(zc, dtype=float)
+
+        # lissage du profil
+        o = np.argsort(xc)
+        xc, zc = xc[o], zc[o]
+        if len(zc) >= 11:
+            zc = savgol_filter(zc, 11, 2)
+
+        # dérivée seconde
+        dz = np.gradient(zc, xc)
+        d2z = np.gradient(dz, xc)
+
+        # point le plus concave (candidat ligne rachidienne)
+        idx = int(np.argmin(d2z))
+        x0 = float(xc[idx])
+
+        y_mid = float(np.mean(sl[:, 1]))
+        z0 = float(np.percentile(z, 90))
+
+        # continuité
+        if prev_x is not None and abs(x0 - prev_x) > 1.5:
             x0 = prev_x
         prev_x = x0
 
@@ -226,11 +262,11 @@ def extract_midline_rot_corrected(pts, remove_shoulders=True):
     spine = np.array(spine, dtype=float)
     spine = spine[np.argsort(spine[:, 1])]
 
-    # remettre dans repère original (rotation inverse)
-    XZ_sp = spine[:, [0, 2]] @ R  # R^-1 = R.T, ici on a utilisé R.T plus haut, donc retour via R
-    spine[:, 0] = XZ_sp[:, 0]
-    spine[:, 2] = XZ_sp[:, 1]
-
+    # 2) retour repère original
+    # on avait: XZ_rot = XZ @ R.T -> retour = XZ_rot @ R
+    XZ_back = spine[:, [0, 2]] @ R
+    spine[:, 0] = XZ_back[:, 0]
+    spine[:, 2] = XZ_back[:, 1]
     return spine
 
 # ==============================
@@ -264,11 +300,11 @@ if ply_file:
         mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
         pts = pts[mask]
 
-        # --- centrage X global (juste pour l'affichage stable) ---
+        # --- centrage X global (affichage stable) ---
         pts[:, 0] -= np.median(pts[:, 0])
 
-        # --- extraction axe robuste + correction rotation ---
-        spine = extract_midline_rot_corrected(pts, remove_shoulders=remove_shoulders)
+        # --- extraction colonne (courbure) ---
+        spine = extract_spine_by_curvature(pts, remove_shoulders=remove_shoulders)
         if spine.shape[0] < 10:
             st.error("Extraction insuffisante. Essaie de désactiver 'Supprimer épaules' ou améliore le scan.")
             st.stop()
@@ -287,14 +323,14 @@ if ply_file:
 
         fig_f, ax_f = plt.subplots(figsize=(2.2, 4))
         ax_f.scatter(pts[:, 0], pts[:, 1], s=0.2, alpha=0.08, color="gray")
-        ax_f.plot(spine[:, 0], spine[:, 1], "red", linewidth=2.2)
+        ax_f.plot(spine[:, 0], spine[:, 1], "red", linewidth=2.4)
         ax_f.set_title("Frontale", fontsize=9)
         ax_f.axis("off")
         fig_f.savefig(img_f_p, bbox_inches="tight", dpi=160)
 
         fig_s, ax_s = plt.subplots(figsize=(2.2, 4))
         ax_s.scatter(pts[:, 2], pts[:, 1], s=0.2, alpha=0.08, color="gray")
-        ax_s.plot(spine[:, 2], spine[:, 1], "blue", linewidth=2.2)
+        ax_s.plot(spine[:, 2], spine[:, 1], "blue", linewidth=2.4)
         if vertical_z.size:
             ax_s.plot(vertical_z, spine[:, 1], "k--", alpha=0.7, linewidth=1)
         ax_s.set_title("Sagittale", fontsize=9)
@@ -314,8 +350,7 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Correction clé : redressement automatique du tronc (rotation XZ) avant extraction.
-                Centre robuste : moyenne quantiles 20–80 (peu sensible à la densité).
+                Frontal : extraction par <b>courbure</b> du profil dorsal (approx. ligne des épineuses) + redressement automatique (rotation XZ).
             </div>
         </div>
         """, unsafe_allow_html=True)
