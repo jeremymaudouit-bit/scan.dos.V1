@@ -147,44 +147,117 @@ def smooth_spine(spine, window=61, strong=True, median_k=9):
     return out
 
 # ==============================
-# AXE MEDIAN ROBUSTE (tranches) + ✅ CENTRAGE LOCAL
+# SURFACE-WEIGHT CENTER (anti densité)
 # ==============================
-def extract_midline(pts, remove_shoulders=True):
+def symmetry_center_1d(xc, zc):
+    """Trouve c qui minimise l'asymétrie du profil z(x)."""
+    if len(xc) < 8:
+        return float(np.median(xc))
+    xmin, xmax = float(np.min(xc)), float(np.max(xc))
+    span = xmax - xmin
+    a = xmin + 0.12 * span
+    b = xmax - 0.12 * span
+    if b <= a:
+        return float(np.median(xc))
+
+    candidates = np.linspace(a, b, 31)
+    best_c, best_cost = None, np.inf
+    for c in candidates:
+        umax = min(c - xmin, xmax - c)
+        if umax <= 0:
+            continue
+        us = np.linspace(0, umax, 25)
+        zL = np.interp(c - us, xc, zc)
+        zR = np.interp(c + us, xc, zc)
+        cost = float(np.mean(np.abs(zR - zL)))
+        if cost < best_cost:
+            best_cost, best_c = cost, c
+    return float(best_c if best_c is not None else np.median(xc))
+
+def extract_midline_surface(pts, cell_cm=0.4, remove_shoulders=True,
+                           z_surface_percentile=95, keep_top_x_profile=35):
+    """
+    Extraction 100% surface-weight:
+    - bins en X (cell_cm)
+    - par bin: z_surface = percentile élevé (dos)
+    - centre = symétrie du profil z(x)
+    -> pas de biais densité
+    """
     y = pts[:, 1]
     y0 = np.percentile(y, 10)
     y1 = np.percentile(y, 92)
     slices = np.linspace(y0, y1, 120)
 
     spine = []
-    prev_x = None
+    prev_x0 = None
 
     for i in range(len(slices) - 1):
         sl = pts[(y >= slices[i]) & (y < slices[i + 1])]
-        if sl.shape[0] < 25:
+        if sl.shape[0] < 40:
             continue
 
-        # ✅ CENTRAGE ANATOMIQUE LOCAL (par tranche)
-        xvals = sl[:, 0] - np.median(sl[:, 0])
-        zvals = sl[:, 2]
+        # centrage local (sur points de la tranche) pour stabiliser le profil
+        x_local = sl[:, 0] - np.median(sl[:, 0])
+        z = sl[:, 2]
 
+        # option épaules: on ne garde que le "dos" (z haut) dans la tranche
         if remove_shoulders:
-            thr = np.percentile(zvals, 80)
-            m = zvals >= thr
-            if np.count_nonzero(m) > 10:
-                xvals = xvals[m]
-                zvals = zvals[m]
+            thr = np.percentile(z, 80)
+            m = z >= thr
+            if np.count_nonzero(m) > 20:
+                x_local = x_local[m]
+                z = z[m]
 
-        if xvals.size < 5:
+        if x_local.size < 30:
             continue
 
-        x0 = float(np.median(xvals))
+        # bins X (surface)
+        xmin, xmax = np.percentile(x_local, [2, 98])
+        if xmax - xmin < 1e-6:
+            continue
+
+        nbins = max(25, int(np.ceil((xmax - xmin) / cell_cm)))
+        edges = np.linspace(xmin, xmax, nbins + 1)
+
+        xc, zc = [], []
+        for b in range(nbins):
+            m = (x_local >= edges[b]) & (x_local < edges[b + 1])
+            if np.count_nonzero(m) < 4:
+                continue
+            xc.append(0.5 * (edges[b] + edges[b + 1]))
+            zc.append(float(np.percentile(z[m], z_surface_percentile)))  # surface dos
+
+        if len(xc) < 10:
+            continue
+
+        xc = np.array(xc, dtype=float)
+        zc = np.array(zc, dtype=float)
+
+        # garder seulement le "dos" du profil (évite flancs / trous)
+        thr = np.percentile(zc, 100 - keep_top_x_profile)
+        sel = zc >= thr
+        if np.count_nonzero(sel) >= 10:
+            xc = xc[sel]
+            zc = zc[sel]
+
+        # ordonner + mini lissage du profil
+        o = np.argsort(xc)
+        xc = xc[o]
+        zc = zc[o]
+        if len(zc) >= 11:
+            w = 9
+            if w < len(zc):
+                zc = savgol_filter(zc, w, 2)
+
+        x0 = symmetry_center_1d(xc, zc)
         y_mid = float(np.mean(sl[:, 1]))
-        z0 = float(np.percentile(zvals, 90))
+        z0 = float(np.percentile(z, 90))
 
-        if prev_x is not None and abs(x0 - prev_x) > 1.2:
-            x0 = prev_x
+        # continuité douce (évite gros saut haut du tronc)
+        if prev_x0 is not None and abs(x0 - prev_x0) > 1.2:
+            x0 = prev_x0
+        prev_x0 = x0
 
-        prev_x = x0
         spine.append([x0, y_mid, z0])
 
     if len(spine) == 0:
@@ -205,11 +278,15 @@ with st.sidebar:
 
     remove_shoulders = st.toggle("Supprimer épaules (haut)", True)
 
+    st.subheader("🧩 Surface (anti densité)")
+    # un seul réglage “surface” facile
+    cell_mm = st.slider("Résolution surface (mm)", 2, 10, 4)
+
     st.subheader("🧽 Lissage")
     do_smooth = st.toggle("Activer", True)
     strong_smooth = st.toggle("Lissage fort (anti-pics)", True)
-    smooth_window = st.slider("Fenêtre lissage", 5, 151, 61, step=2)
-    median_k = st.slider("Anti-pics (médian)", 3, 31, 9, step=2)
+    smooth_window = st.slider("Fenêtre lissage", 5, 151, 81, step=2)
+    median_k = st.slider("Anti-pics (médian)", 3, 31, 11, step=2)
 
     st.divider()
     ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
@@ -225,13 +302,21 @@ if ply_file:
         mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
         pts = pts[mask]
 
-        # --- centrage X global (garde) ---
+        # --- centrage X global ---
         pts[:, 0] -= np.median(pts[:, 0])
 
-        # --- extraction axe (centrage local intégré) ---
-        spine = extract_midline(pts, remove_shoulders=remove_shoulders)
+        # --- extraction axe (SURFACE-WEIGHT) ---
+        cell_cm = float(cell_mm) / 10.0
+        spine = extract_midline_surface(
+            pts,
+            cell_cm=cell_cm,
+            remove_shoulders=remove_shoulders,
+            z_surface_percentile=95,
+            keep_top_x_profile=35
+        )
+
         if spine.shape[0] < 10:
-            st.error("Extraction insuffisante : scan trop incomplet sur le tronc.")
+            st.error("Extraction insuffisante : augmente la résolution surface (mm) ou désactive suppression épaules.")
             st.stop()
 
         # --- lissage ---
@@ -248,21 +333,21 @@ if ply_file:
 
         fig_f, ax_f = plt.subplots(figsize=(2.2, 4))
         ax_f.scatter(pts[:, 0], pts[:, 1], s=0.2, alpha=0.08, color="gray")
-        ax_f.plot(spine[:, 0], spine[:, 1], "red", linewidth=2.0)
+        ax_f.plot(spine[:, 0], spine[:, 1], "red", linewidth=2.2)
         ax_f.set_title("Frontale", fontsize=9)
         ax_f.axis("off")
         fig_f.savefig(img_f_p, bbox_inches="tight", dpi=160)
 
         fig_s, ax_s = plt.subplots(figsize=(2.2, 4))
         ax_s.scatter(pts[:, 2], pts[:, 1], s=0.2, alpha=0.08, color="gray")
-        ax_s.plot(spine[:, 2], spine[:, 1], "blue", linewidth=2.0)
+        ax_s.plot(spine[:, 2], spine[:, 1], "blue", linewidth=2.2)
         if vertical_z.size:
             ax_s.plot(vertical_z, spine[:, 1], "k--", alpha=0.7, linewidth=1)
         ax_s.set_title("Sagittale", fontsize=9)
         ax_s.axis("off")
         fig_s.savefig(img_s_p, bbox_inches="tight", dpi=160)
 
-        # --- affichage compact ---
+        # --- affichage ---
         st.write("### 📈 Analyse Visuelle")
         _, c1, c2, _ = st.columns([1, 1, 1, 1])
         c1.pyplot(fig_f)
@@ -275,8 +360,8 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Correction du décalage : centrage anatomique <b>local par tranche</b> (évite les scans asymétriques).
-                Lissage réglable.
+                Frontal : extraction <b>surface-weight</b> (bins X) → indépendante de la densité du scan.
+                Résolution surface : {cell_mm} mm.
             </div>
         </div>
         """, unsafe_allow_html=True)
