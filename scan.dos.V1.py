@@ -53,17 +53,14 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
     story.append(Paragraph(f"<b>Patient :</b> {patient_info['prenom']} {patient_info['nom']}", styles["Normal"]))
     story.append(Spacer(1, 0.4 * cm))
 
-    def ok_badge(text, ok=True):
-        col = "#156f3b" if ok else "#9b1c1c"
-        return f'<font color="{col}"><b>{text}</b></font>'
-
     data = [
         ["Indicateur", "Valeur Mesurée"],
         ["Flèche Dorsale", f"{results['fd']:.2f} cm"],
-        ["Flèche Lombaire", f"{results['fl']:.2f} cm  ({results['fl_status']})"],
+        ["Flèche Lombaire", f"{results['fl']:.2f} cm ({results['fl_status']})"],
         ["Déviation Latérale Max", f"{results['dev_f']:.2f} cm"],
         ["Angle Lordose Lombaire (est.)", f"{results['lordosis_deg']:.1f}°"],
         ["Angle Cyphose Dorsale (est.)", f"{results['kyphosis_deg']:.1f}°"],
+        ["Jonction Thoraco-Lombaire (est.)", f"{results['y_junction']:.1f} cm" if results['y_junction'] is not None else "n/a"],
         ["Couverture / Fiabilité", f"{results['coverage_pct']:.0f}% / {results['reliability_pct']:.0f}%"],
     ]
 
@@ -89,7 +86,8 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
 # ==============================
 def compute_sagittal_arrow_lombaire_v2(spine_cm):
     """
-    Simplifié: fl = |z_min - z_max|. (Comme ton code)
+    Version simple cohérente avec ton code initial:
+    fl = |z_min - z_max|
     """
     y = spine_cm[:, 1]
     z = spine_cm[:, 2]
@@ -180,9 +178,9 @@ def apply_rotation_xz(pts, R):
     return np.column_stack([XZ_rot[:, 0], pts[:, 1], XZ_rot[:, 1]])
 
 # ==============================
-# MIDLINE + QUALITY (density-free)
+# MIDLINE + QUALITY (anti-biais densité)
 # ==============================
-def slice_profile_surface_binned(sl, cell_cm=0.6, z_percentile=92, min_pts_per_bin=2):
+def slice_profile_surface_binned(sl, cell_cm=0.70, z_percentile=92, min_pts_per_bin=2):
     x = sl[:, 0]
     z = sl[:, 2]
     xmin, xmax = np.percentile(x, [2, 98])
@@ -219,18 +217,9 @@ def midline_from_profile(xc, zc, q_edge=8):
     return x_mid, z_mid
 
 def quality_score(n_points_slice, n_bins, width_cm, jump_cm, expected_width=(10.0, 45.0)):
-    """
-    Retourne un score 0..1 basé sur:
-    - nb points dans la slice (mais sans influencer le centre)
-    - nb bins valides
-    - largeur plausible
-    - continuité (jump)
-    """
-    # points (capé)
     s_pts = np.clip((n_points_slice - 30) / 200.0, 0.0, 1.0)
-    # bins
     s_bins = np.clip((n_bins - 10) / 25.0, 0.0, 1.0)
-    # width
+
     w_lo, w_hi = expected_width
     if width_cm <= 0:
         s_w = 0.0
@@ -240,13 +229,12 @@ def quality_score(n_points_slice, n_bins, width_cm, jump_cm, expected_width=(10.
         s_w = np.clip(w_hi / width_cm, 0.0, 1.0)
     else:
         s_w = 1.0
-    # jump
+
     if jump_cm is None:
         s_j = 1.0
     else:
-        s_j = np.clip(1.0 - (abs(jump_cm) / 4.0), 0.0, 1.0)  # >4cm => mauvais
+        s_j = np.clip(1.0 - (abs(jump_cm) / 4.0), 0.0, 1.0)
 
-    # pondération
     score = 0.25 * s_pts + 0.35 * s_bins + 0.25 * s_w + 0.15 * s_j
     return float(np.clip(score, 0.0, 1.0))
 
@@ -270,8 +258,8 @@ def extract_midline_full_with_quality(
     n_slices = int(np.clip((pr.shape[0] // 2500) + 240, 220, 360))
     edges_y = np.linspace(y0, y1, n_slices)
 
-    spine = []        # x,y,z
-    qlist = []        # quality 0..1
+    spine = []
+    qlist = []
     prev_x = None
     prev_z = None
 
@@ -279,11 +267,10 @@ def extract_midline_full_with_quality(
         sl = pr[(y >= edges_y[i]) & (y < edges_y[i + 1])]
         y_mid = float(0.5 * (edges_y[i] + edges_y[i + 1]))
 
-        # très peu de points
         if sl.shape[0] < 25:
             if allow_fill_gaps and prev_x is not None and prev_z is not None:
                 spine.append([prev_x, y_mid, prev_z])
-                qlist.append(0.15)  # rempli => faible
+                qlist.append(0.15)
             continue
 
         if remove_lateral_outliers:
@@ -296,9 +283,7 @@ def extract_midline_full_with_quality(
                     qlist.append(0.15)
                 continue
 
-        # essai 1
         xc, zc, width = slice_profile_surface_binned(sl, cell_cm=cell_cm, z_percentile=z_percentile, min_pts_per_bin=2)
-        # essai 2 (bins plus larges)
         if xc is None:
             xc, zc, width = slice_profile_surface_binned(sl, cell_cm=min(1.10, cell_cm * 1.5), z_percentile=z_percentile, min_pts_per_bin=2)
 
@@ -308,7 +293,6 @@ def extract_midline_full_with_quality(
                 qlist.append(0.15)
             continue
 
-        # lissage profil (bins)
         if len(zc) >= 9:
             zc_s = savgol_filter(zc, 9, 2)
         else:
@@ -316,7 +300,6 @@ def extract_midline_full_with_quality(
 
         x0, z0 = midline_from_profile(xc, zc_s, q_edge=q_edge)
 
-        # continuité (évite sauts)
         jump = None if prev_x is None else (x0 - prev_x)
         if prev_x is not None and abs(jump) > 3.0:
             x0 = prev_x
@@ -344,64 +327,97 @@ def extract_midline_full_with_quality(
     spine = spine[o]
     qlist = qlist[o]
 
-    # retour repère original
     XZ_back = spine[:, [0, 2]] @ R
     spine[:, 0] = XZ_back[:, 0]
     spine[:, 2] = XZ_back[:, 1]
     return spine, qlist
 
 # ==============================
-# ANGLES (estimations)
+# ANGLES V2 (concavité/convexité + tangentes)
 # ==============================
-def _segment_angle_deg(dz, dy):
-    # angle par rapport à la verticale (dy)
-    # on prend la valeur absolue de l'angle
-    ang = np.degrees(np.arctan2(dz, dy))
-    return float(ang)
-
-def estimate_lordosis_kyphosis_angles(spine):
+def estimate_lordosis_kyphosis_angles_v2(spine, smooth_win=21):
     """
-    Estimation sur le profil sagittal z(y).
-    On découpe par percentiles en Y (répétable pour suivi).
+    Estime angles lordose/cyphose dans le plan sagittal à partir de z(y).
+    - Lordose = concavité basse
+    - Cyphose = convexité haute
+    Mesure = différence d'angles entre tangentes (en degrés).
+
+    Retour: (lordosis_deg, kyphosis_deg, y_junction)
     """
-    if spine.shape[0] < 20:
-        return 0.0, 0.0
+    if spine.shape[0] < 25:
+        return 0.0, 0.0, None
 
-    y = spine[:, 1]
-    z = spine[:, 2]
+    s = spine[np.argsort(spine[:, 1])]
+    y = s[:, 1].astype(float)
+    z = s[:, 2].astype(float)
 
-    # lissage léger pour la pente
-    z_s = savgol_filter(z, 11 if len(z) >= 11 else (len(z)//2*2+1), 2) if len(z) >= 7 else z
+    n = len(z)
+    w = int(smooth_win)
+    if w % 2 == 0:
+        w += 1
+    # clamp to valid odd window < n
+    if w >= n:
+        w = n - 1 if (n - 1) % 2 == 1 else n - 2
+    w = max(7, w)
 
-    # régions (en % de hauteur)
-    y10, y30, y55, y80, y95 = np.percentile(y, [10, 30, 55, 80, 95])
+    z_s = savgol_filter(z, w, 3)
 
-    # Lombaire approx : 10-30% (bas du dos)
-    mL = (y >= y10) & (y <= y30)
-    # Dorsale approx : 55-80% (milieu/haut)
-    mT = (y >= y55) & (y <= y80)
+    dz = np.gradient(z_s, y)
+    d2z = np.gradient(dz, y)
 
-    def region_angle(mask):
-        yy = y[mask]
-        zz = z_s[mask]
-        if yy.size < 6:
-            return 0.0
-        # fit linéaire z = a*y + b => pente a
-        a = np.polyfit(yy, zz, 1)[0]
-        # angle "inclinaison" (dz/dy)
-        return abs(np.degrees(np.arctan(a)))
+    y20 = np.percentile(y, 20)
+    y80 = np.percentile(y, 80)
+    low = d2z[y <= y20]
+    high = d2z[y >= y80]
+    if low.size < 3 or high.size < 3:
+        return 0.0, 0.0, None
 
-    lordosis = region_angle(mL)
-    kyphosis = region_angle(mT)
-    return float(lordosis), float(kyphosis)
+    sign_low = np.sign(np.median(low))
+    sign_high = np.sign(np.median(high))
+
+    # On veut bas ~ concave (positif) et haut ~ convexe (négatif).
+    # Si c'est inversé, on inverse le signe (équivalent à inverser z).
+    if (sign_low < 0 and sign_high > 0):
+        d2z = -d2z
+        dz = -dz
+
+    # jonction = zone centrale où |d2z| minimal (proche inflexion)
+    y_mid_lo = np.percentile(y, 35)
+    y_mid_hi = np.percentile(y, 65)
+    mid_mask = (y >= y_mid_lo) & (y <= y_mid_hi)
+    idx_mid = np.where(mid_mask)[0]
+    if idx_mid.size == 0:
+        return 0.0, 0.0, None
+
+    j = idx_mid[np.argmin(np.abs(d2z[idx_mid]))]
+    y_j = float(y[j])
+
+    y_bot = float(np.percentile(y, 8))
+    y_top = float(np.percentile(y, 92))
+
+    i_bot = int(np.argmin(np.abs(y - y_bot)))
+    i_top = int(np.argmin(np.abs(y - y_top)))
+    i_j = int(j)
+
+    theta = np.degrees(np.arctan(dz))
+
+    lordosis = float(abs(theta[i_j] - theta[i_bot]))
+    kyphosis = float(abs(theta[i_top] - theta[i_j]))
+
+    # fallback si jonction trop proche des bords
+    if (y_j - y_bot) < 0.15 * (y_top - y_bot) or (y_top - y_j) < 0.15 * (y_top - y_bot):
+        y_j_fb = float(np.percentile(y, 50))
+        i_j_fb = int(np.argmin(np.abs(y - y_j_fb)))
+        lordosis = float(abs(theta[i_j_fb] - theta[i_bot]))
+        kyphosis = float(abs(theta[i_top] - theta[i_j_fb]))
+        y_j = y_j_fb
+
+    return lordosis, kyphosis, y_j
 
 # ==============================
-# PLOTTING (colored curve)
+# COLORED CURVE PLOT
 # ==============================
 def plot_colored_curve(ax, x, y, q, lw=2.6):
-    """
-    q in [0,1], 0=rouge, 1=vert (colormap RdYlGn)
-    """
     if len(x) < 2:
         return
     pts = np.column_stack([x, y]).reshape(-1, 1, 2)
@@ -435,16 +451,20 @@ with st.sidebar:
     q_edge = st.slider("Bords (quantile X)", 5, 20, 8, step=1)
 
     st.divider()
-    st.subheader("🧽 Lissage final")
+    st.subheader("🧽 Lissage final (courbe)")
     do_smooth = st.toggle("Activer", True)
     strong_smooth = st.toggle("Lissage fort (anti-pics)", True)
     smooth_window = st.slider("Fenêtre lissage", 5, 151, 91, step=2)
     median_k = st.slider("Anti-pics (médian)", 3, 31, 11, step=2)
 
     st.divider()
+    st.subheader("📐 Angles (plan sagittal)")
+    angle_smooth = st.slider("Lissage angles (fenêtre)", 7, 41, 21, step=2)
+
+    st.divider()
     ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
 
-st.title("🦴 SpineScan Pro — Midline + Fiabilité + Angles")
+st.title("🦴 SpineScan Pro — Midline + Fiabilité + Angles (V2)")
 
 if ply_file:
     if st.button("⚙️ LANCER L'ANALYSE BIOMÉCANIQUE"):
@@ -472,7 +492,7 @@ if ply_file:
             st.error("Impossible d'extraire une courbe (scan trop incomplet).")
             st.stop()
 
-        # lissage final (sur x,z) + on garde q tel quel
+        # lissage final
         if do_smooth:
             spine = smooth_spine(spine, window=smooth_window, strong=strong_smooth, median_k=median_k)
 
@@ -481,21 +501,19 @@ if ply_file:
         fl_status = classify_fl(fl, 2.5, 4.5)
         dev_f = float(np.max(np.abs(spine[:, 0]))) if spine.size else 0.0
 
-        # angles (est.)
-        lordosis_deg, kyphosis_deg = estimate_lordosis_kyphosis_angles(spine)
+        # angles V2 (concavité/convexité)
+        lordosis_deg, kyphosis_deg, y_junction = estimate_lordosis_kyphosis_angles_v2(spine, smooth_win=int(angle_smooth))
 
         # couverture / fiabilité
         y_span_pts = float(np.percentile(pts[:, 1], 98) - np.percentile(pts[:, 1], 2))
         y_span_sp = float(np.max(spine[:, 1]) - np.min(spine[:, 1])) if spine.shape[0] else 0.0
         coverage_pct = 100.0 * (y_span_sp / y_span_pts) if y_span_pts > 1e-6 else 0.0
-
         reliability_pct = 100.0 * float(np.mean(q >= 0.6)) if q.size else 0.0
 
         # ---------- FIGURES ----------
         tmp = tempfile.gettempdir()
         img_f_p, img_s_p = os.path.join(tmp, "f.png"), os.path.join(tmp, "s.png")
 
-        # Frontale (x vs y) avec couleur fiabilité
         fig_f, ax_f = plt.subplots(figsize=(2.4, 4.2))
         ax_f.scatter(pts[:, 0], pts[:, 1], s=0.2, alpha=0.08, color="gray")
         plot_colored_curve(ax_f, spine[:, 0], spine[:, 1], q, lw=2.8)
@@ -503,12 +521,13 @@ if ply_file:
         ax_f.axis("off")
         fig_f.savefig(img_f_p, bbox_inches="tight", dpi=170)
 
-        # Sagittale (z vs y) avec couleur fiabilité
         fig_s, ax_s = plt.subplots(figsize=(2.4, 4.2))
         ax_s.scatter(pts[:, 2], pts[:, 1], s=0.2, alpha=0.08, color="gray")
         plot_colored_curve(ax_s, spine[:, 2], spine[:, 1], q, lw=2.8)
         if vertical_z.size:
             ax_s.plot(vertical_z, spine[:, 1], "k--", alpha=0.7, linewidth=1)
+        if y_junction is not None:
+            ax_s.axhline(y_junction, linestyle="--", linewidth=1, alpha=0.6)
         ax_s.set_title("Sagittale (couleur = fiabilité)", fontsize=9)
         ax_s.axis("off")
         fig_s.savefig(img_s_p, bbox_inches="tight", dpi=170)
@@ -518,7 +537,6 @@ if ply_file:
         c1.pyplot(fig_f)
         c2.pyplot(fig_s)
 
-        # Barre couleur fiabilité
         st.write("### 🎨 Légende fiabilité")
         st.caption("Rouge = faible | Jaune = moyen | Vert = fiable (score 0→1)")
         fig_leg, ax_leg = plt.subplots(figsize=(5.0, 0.35))
@@ -539,17 +557,17 @@ if ply_file:
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <p><b>📐 Angle lordose lombaire (est.) :</b> <span class="value-text">{lordosis_deg:.1f}°</span></p>
             <p><b>📐 Angle cyphose dorsale (est.) :</b> <span class="value-text">{kyphosis_deg:.1f}°</span></p>
+            <p><b>🔁 Jonction thoraco-lombaire (est.) :</b> <span class="value-text">{(f"{y_junction:.1f} cm" if y_junction is not None else "n/a")}</span></p>
             <p><b>✅ Couverture hauteur :</b> <span class="value-text">{coverage_pct:.0f}%</span>
                &nbsp; <b>Fiabilité :</b> <span class="value-text">{reliability_pct:.0f}%</span>
                <br><span style="color:#666;font-size:0.9rem;">Fiabilité = % des points avec score ≥ 0.60</span></p>
             <div class="disclaimer">
                 Midline “tout le dos” = milieu entre bords (bins X, anti-biais densité) + couleur selon score qualité.
-                Les angles sont des estimations basées sur la pente sagittale par zones (répétable pour suivi si protocole constant).
+                Angles V2 = calcul dans le plan sagittal via concavité/convexité (z''(y)) + différence de tangentes.
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # Export PDF
         res = {
             "fd": float(fd),
             "fl": float(fl),
@@ -557,6 +575,7 @@ if ply_file:
             "dev_f": float(dev_f),
             "lordosis_deg": float(lordosis_deg),
             "kyphosis_deg": float(kyphosis_deg),
+            "y_junction": None if y_junction is None else float(y_junction),
             "coverage_pct": float(coverage_pct),
             "reliability_pct": float(reliability_pct),
         }
