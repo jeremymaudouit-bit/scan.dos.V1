@@ -147,7 +147,7 @@ def smooth_spine(spine, window=61, strong=True, median_k=9):
     return out
 
 # ==============================
-# AXE MEDIAN ROBUSTE (tranches)
+# AXE MEDIAN ROBUSTE (tranches) + ✅ CENTRAGE LOCAL
 # ==============================
 def extract_midline(pts, remove_shoulders=True):
     y = pts[:, 1]
@@ -163,7 +163,8 @@ def extract_midline(pts, remove_shoulders=True):
         if sl.shape[0] < 25:
             continue
 
-        xvals = sl[:, 0]
+        # ✅ CENTRAGE ANATOMIQUE LOCAL (par tranche)
+        xvals = sl[:, 0] - np.median(sl[:, 0])
         zvals = sl[:, 2]
 
         if remove_shoulders:
@@ -224,10 +225,10 @@ if ply_file:
         mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
         pts = pts[mask]
 
-        # --- centrage X robuste ---
+        # --- centrage X global (garde) ---
         pts[:, 0] -= np.median(pts[:, 0])
 
-        # --- extraction axe ---
+        # --- extraction axe (centrage local intégré) ---
         spine = extract_midline(pts, remove_shoulders=remove_shoulders)
         if spine.shape[0] < 10:
             st.error("Extraction insuffisante : scan trop incomplet sur le tronc.")
@@ -274,7 +275,8 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Axe médian robuste par tranches + option suppression épaules + lissage réglable.
+                Correction du décalage : centrage anatomique <b>local par tranche</b> (évite les scans asymétriques).
+                Lissage réglable.
             </div>
         </div>
         """, unsafe_allow_html=True)
