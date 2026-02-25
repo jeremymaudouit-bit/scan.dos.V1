@@ -82,7 +82,7 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
     return path
 
 # ==============================
-# Metrics (sagittal unchanged)
+# Metrics (sagittal)
 # ==============================
 def compute_sagittal_arrow_lombaire_v2(spine_cm):
     y = spine_cm[:, 1]
@@ -118,15 +118,12 @@ def smooth_spine(spine, smooth_val=25, poly=3):
     return out
 
 # =========================================================
-# ✅ FRONTAL FROM SCRATCH: "MOYENNE DE SURFACE" (pas points)
+# FRONTAL (surface-weighted)
 # =========================================================
-def build_dorsal_surface_grid(pts_cm, cell_cm=0.3, z_percentile=95):
+def build_dorsal_surface_grid(pts_cm, cell_cm=0.4, z_percentile=95):
     """
-    Construit une surface du dos en grille (x,y)->z_surface.
-    Chaque cellule (x,y) a 1 valeur => poids surface uniforme (anti densité).
-
-    Retourne:
-      x_centers (nx,), y_centers (ny,), Z (ny,nx) avec np.nan si vide
+    Grille surface (x,y)->z_surface (percentile élevé).
+    Chaque cellule pèse pareil => pas de biais de densité.
     """
     x = pts_cm[:, 0]
     y = pts_cm[:, 1]
@@ -135,35 +132,30 @@ def build_dorsal_surface_grid(pts_cm, cell_cm=0.3, z_percentile=95):
     xmin, xmax = np.percentile(x, [1, 99])
     ymin, ymax = np.percentile(y, [1, 99])
 
-    if xmax - xmin < 1e-6 or ymax - ymin < 1e-6:
+    if (xmax - xmin) < 1e-6 or (ymax - ymin) < 1e-6:
         return None
 
-    nx = max(20, int(np.ceil((xmax - xmin) / cell_cm)))
-    ny = max(40, int(np.ceil((ymax - ymin) / cell_cm)))
+    nx = max(25, int(np.ceil((xmax - xmin) / cell_cm)))
+    ny = max(60, int(np.ceil((ymax - ymin) / cell_cm)))
 
-    # indices de cellule
     ix = np.clip(((x - xmin) / cell_cm).astype(int), 0, nx - 1)
     iy = np.clip(((y - ymin) / cell_cm).astype(int), 0, ny - 1)
 
-    # regrouper par (iy, ix) via clé
     key = iy * nx + ix
     order = np.argsort(key)
     key_s = key[order]
     z_s = z[order]
 
-    # init grille
     Z = np.full((ny, nx), np.nan, dtype=float)
 
-    # parcours groupes
     splits = np.where(np.diff(key_s) != 0)[0] + 1
-    groups = np.split(z_s, splits)
-    keys_g = np.split(key_s, splits)
+    z_groups = np.split(z_s, splits)
+    k_groups = np.split(key_s, splits)
 
-    for k_arr, z_arr in zip(keys_g, groups):
+    for k_arr, z_arr in zip(k_groups, z_groups):
         k0 = int(k_arr[0])
         gy = k0 // nx
         gx = k0 % nx
-        # valeur de surface (dos): percentile élevé de z dans la cellule
         Z[gy, gx] = float(np.percentile(z_arr, z_percentile))
 
     x_centers = xmin + (np.arange(nx) + 0.5) * cell_cm
@@ -171,9 +163,7 @@ def build_dorsal_surface_grid(pts_cm, cell_cm=0.3, z_percentile=95):
     return x_centers, y_centers, Z
 
 def symmetry_center_1d(xc, zc):
-    """
-    Trouve le centre c qui rend z(x) le plus symétrique.
-    """
+    """Centre c minimisant l'asymétrie du profil z(x)."""
     if len(xc) < 10:
         return float(np.median(xc))
 
@@ -185,8 +175,7 @@ def symmetry_center_1d(xc, zc):
         return float(np.median(xc))
 
     candidates = np.linspace(a, b, 31)
-    best_c = None
-    best_cost = np.inf
+    best_c, best_cost = None, np.inf
 
     for c in candidates:
         umax = min(c - xmin, xmax - c)
@@ -202,19 +191,15 @@ def symmetry_center_1d(xc, zc):
 
     return float(best_c if best_c is not None else np.median(xc))
 
-def frontal_centerline_from_surface(pts_cm, cell_cm=0.3, z_cell_percentile=95,
-                                    keep_top_percent_rows=35):
+def frontal_centerline_from_surface(pts_cm, cell_cm=0.4, z_cell_percentile=95, keep_top_percent_rows=35):
     """
-    Construit la ligne frontale X(Y) à partir d'une SURFACE (grille).
-    - chaque cellule pèse pareil (anti densité)
-    - pour chaque Y, on utilise le profil z(x) et on prend le centre par symétrie
-
-    keep_top_percent_rows: on garde seulement les cellules les plus dorsales dans la ligne Y
-    (utile si la grille contient du bruit "devant" / trous).
+    Pour chaque ligne Y de la grille :
+      - on garde les cellules les plus dorsales (top %)
+      - on trouve le centre par symétrie z(x)
     """
     grid = build_dorsal_surface_grid(pts_cm, cell_cm=cell_cm, z_percentile=z_cell_percentile)
     if grid is None:
-        return np.empty((0, 3), dtype=float), None
+        return np.empty((0, 3), dtype=float)
 
     xc, yc, Z = grid
     ny, nx = Z.shape
@@ -223,42 +208,56 @@ def frontal_centerline_from_surface(pts_cm, cell_cm=0.3, z_cell_percentile=95,
     for j in range(ny):
         row = Z[j, :]
         ok = np.isfinite(row)
-        if np.count_nonzero(ok) < max(8, nx // 10):
+        if np.count_nonzero(ok) < max(10, nx // 10):
             continue
 
         x_row = xc[ok]
         z_row = row[ok]
 
-        # option: ne garder que le "dos" dans cette ligne (top z)
+        # garder uniquement le dos dans cette rangée (top z)
         thr = np.percentile(z_row, 100 - keep_top_percent_rows)
         sel = z_row >= thr
-        if np.count_nonzero(sel) >= 8:
+        if np.count_nonzero(sel) >= 10:
             x_row = x_row[sel]
             z_row = z_row[sel]
 
-        # léger lissage du profil (si possible)
+        # ordonner
+        order = np.argsort(x_row)
+        x_row = x_row[order]
+        z_row = z_row[order]
+
+        # léger lissage du profil
         if len(z_row) >= 11:
-            # ordonner par x
-            order = np.argsort(x_row)
-            x_row = x_row[order]
-            z_row = z_row[order]
-            w = 9 if len(z_row) >= 9 else (len(z_row) // 2) * 2 + 1
-            if w >= 5 and w < len(z_row):
+            w = 9
+            if w < len(z_row):
                 z_row = savgol_filter(z_row, w, 2)
 
         x0 = symmetry_center_1d(x_row, z_row)
         y0 = float(yc[j])
-
-        # pour z0 (sagittal de la ligne), on peut prendre la moyenne "surface" dorsale de la rangée
         z0 = float(np.nanpercentile(row, 90))
-
         spine.append([x0, y0, z0])
 
     spine = np.array(spine, dtype=float)
     if spine.shape[0] == 0:
-        return spine, grid
+        return spine
     spine = spine[np.argsort(spine[:, 1])]
-    return spine, grid
+    return spine
+
+# ==============================
+# AUTO PARAMS (simple & fiable)
+# ==============================
+def params_from_quality(quality: str):
+    """
+    3 presets simples.
+    cell_mm : taille de cellule surface
+    top_row : % le plus dorsal gardé par ligne y
+    """
+    if quality == "Rapide":
+        return {"cell_mm": 6, "z_cell_percentile": 95, "top_row": 30}
+    if quality == "Précis":
+        return {"cell_mm": 3, "z_cell_percentile": 96, "top_row": 40}
+    # Standard
+    return {"cell_mm": 4, "z_cell_percentile": 95, "top_row": 35}
 
 # ==============================
 # UI
@@ -269,15 +268,18 @@ with st.sidebar:
     prenom = st.text_input("Prénom", "Jean")
     st.divider()
 
-    do_smooth = st.toggle("Lissage des courbes", True)
-    smooth_val = st.slider("Intensité lissage", 5, 51, 25, step=2)
+    quality = st.selectbox("Qualité de l'analyse", ["Standard", "Rapide", "Précis"], index=0)
 
-    st.subheader("🧱 Surface (plan frontal)")
-    cell_mm = st.slider("Taille cellule surface (mm)", 2, 10, 4)  # 4mm par défaut
-    z_cell_percentile = st.slider("Surface dos (percentile z/cellule)", 85, 99, 95)
-    keep_top_rows = st.slider("Garder dos (top % par ligne y)", 10, 60, 35)
+    do_smooth = st.toggle("Lissage", True)
+    smooth_val = st.slider("Intensité lissage", 9, 51, 25, step=2)
 
-    st.divider()
+    with st.expander("⚙️ Réglages avancés (optionnel)"):
+        adv_on = st.toggle("Activer réglages avancés", False)
+        if adv_on:
+            cell_mm_adv = st.slider("Taille cellule (mm)", 2, 10, 4)
+            z_cell_percentile_adv = st.slider("Percentile z / cellule", 85, 99, 95)
+            top_row_adv = st.slider("Top % dos / ligne y", 10, 60, 35)
+
     ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
 
 st.title("🦴 SpineScan Pro")
@@ -287,50 +289,57 @@ if ply_file:
         # --- LOAD ---
         pts = load_ply_numpy(ply_file)
 
-        # IMPORTANT: tu faisais *0.1 (mm->cm).
-        # Ici je garde ton hypothèse "PLY en mm". Si ton PLY est déjà en cm, retire *0.1.
+        # ⚠️ Hypothèse identique à ton code original : PLY en mm => cm
         pts = pts * 0.1
 
-        # nettoyage Y (comme avant)
+        # --- nettoyage y ---
         mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
         pts = pts[mask]
 
-        # centrage X robuste (utile)
+        # --- centrage x ---
         pts[:, 0] -= np.median(pts[:, 0])
 
-        # --- FRONTAL: surface-weight extraction ---
+        # --- paramètres simples ---
+        p = params_from_quality(quality)
+        cell_mm = p["cell_mm"]
+        z_cell_percentile = p["z_cell_percentile"]
+        top_row = p["top_row"]
+
+        # override si avancé
+        if "adv_on" in locals() and adv_on:
+            cell_mm = cell_mm_adv
+            z_cell_percentile = z_cell_percentile_adv
+            top_row = top_row_adv
+
+        # --- FRONTAL par surface ---
         cell_cm = float(cell_mm) / 10.0
-        spine, grid = frontal_centerline_from_surface(
+        spine = frontal_centerline_from_surface(
             pts_cm=pts,
             cell_cm=cell_cm,
             z_cell_percentile=z_cell_percentile,
-            keep_top_percent_rows=keep_top_rows
+            keep_top_percent_rows=top_row
         )
 
         if spine.shape[0] < 12:
-            st.error(
-                "Extraction insuffisante dans le frontal. "
-                "Essaie: augmenter la taille cellule (mm), ou baisser 'top % par ligne', "
-                "ou vérifier l'échelle (*0.1)."
-            )
+            st.error("Extraction insuffisante. Essaie 'Rapide' (cellules plus grosses) ou active les réglages avancés.")
             st.stop()
 
-        # Lissage
+        # --- lissage ---
         if do_smooth and spine.shape[0] > smooth_val:
             spine = smooth_spine(spine, smooth_val=smooth_val, poly=3)
 
-        # --- METRICS (sagittal à partir de z0 de la surface) ---
+        # --- métriques ---
         fd, fl, vertical_z = compute_sagittal_arrow_lombaire_v2(spine)
         dev_f = float(np.max(np.abs(spine[:, 0])))
 
-        # --- PLOTS ---
+        # --- graphes ---
         tmp = tempfile.gettempdir()
         img_f_p, img_s_p = os.path.join(tmp, "f.png"), os.path.join(tmp, "s.png")
 
         fig_f, ax_f = plt.subplots(figsize=(2.2, 4))
         ax_f.scatter(pts[:, 0], pts[:, 1], s=0.2, alpha=0.08, color="gray")
         ax_f.plot(spine[:, 0], spine[:, 1], "red", linewidth=2.0)
-        ax_f.set_title("Frontale (moyenne surface)", fontsize=9)
+        ax_f.set_title("Frontale (surface)", fontsize=9)
         ax_f.axis("off")
         fig_f.savefig(img_f_p, bbox_inches="tight", dpi=160)
 
@@ -342,7 +351,7 @@ if ply_file:
         ax_s.axis("off")
         fig_s.savefig(img_s_p, bbox_inches="tight", dpi=160)
 
-        # --- DISPLAY ---
+        # --- affichage ---
         st.write("### 📈 Analyse Visuelle")
         _, v1, v2, _ = st.columns([1, 1, 1, 1])
         v1.pyplot(fig_f)
@@ -355,8 +364,8 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Plan frontal: <b>moyenne de surface</b> via grille (x,y) → z_surface (percentile) donc pas d'influence du nombre de points.
-                Axe: centre par <b>symétrie</b> du profil z(x) à chaque hauteur y.
+                Plan frontal : moyenne de <b>surface</b> (grille) + centre par <b>symétrie</b>. 
+                Preset “{quality}”.
             </div>
         </div>
         """, unsafe_allow_html=True)
