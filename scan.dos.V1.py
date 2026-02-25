@@ -15,8 +15,7 @@ from reportlab.lib.pagesizes import A4
 # ==============================
 st.set_page_config(page_title="SpineScan Pro 3D", layout="wide")
 
-st.markdown(
-    """
+st.markdown("""
     <style>
     .main { background-color: #f8f9fc; }
     .result-box { background-color:#fff; padding:14px; border-radius:10px; border:1px solid #e0e0e0; margin-bottom:10px; }
@@ -24,9 +23,7 @@ st.markdown(
     .stButton>button { background-color: #2c3e50; color: white; width: 100%; border-radius: 8px; font-weight: bold; }
     .disclaimer { font-size: 0.82rem; color: #555; font-style: italic; margin-top: 10px; border-left: 3px solid #ccc; padding-left: 10px;}
     </style>
-    """,
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
 # ==============================
 # IO
@@ -60,17 +57,13 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
     ]
 
     t = Table(data, colWidths=[7 * cm, 7 * cm])
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("FONTSIZE", (0, 0), (-1, -1), 10),
-            ]
-        )
-    )
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+    ]))
     story.append(t)
     story.append(Spacer(1, 0.5 * cm))
 
@@ -151,10 +144,6 @@ def smooth_spine(spine, window=91, strong=True, median_k=11):
 # ROTATION CORRECTION
 # ==============================
 def estimate_rotation_xz(pts):
-    """
-    Estime une rotation 2D sur (X,Z) pour limiter les biais d'orientation.
-    (SVD sur les points de hauteur moyenne)
-    """
     y = pts[:, 1]
     mid = (y > np.percentile(y, 30)) & (y < np.percentile(y, 70))
     pts_mid = pts[mid] if np.count_nonzero(mid) > 200 else pts
@@ -170,76 +159,67 @@ def apply_rotation_xz(pts, R):
     return np.column_stack([XZ_rot[:, 0], pts[:, 1], XZ_rot[:, 1]])
 
 # ==============================
-# SPINOUS PROCESS EXTRACTION (anti-biais densité)
+# LIGNE MÉDIANE DOS (density-free)
 # ==============================
-def x_bins_present(sl, cell_cm=0.45, min_pts_per_bin=3):
+def slice_profile_surface_binned(sl, cell_cm=0.5, z_percentile=95, min_pts_per_bin=3):
     """
-    Centres des bins X non vides (chaque bin = 1 vote).
-    => pas de biais si tu restes longtemps à scanner une zone.
+    Profil surface z(x) en bins X :
+    - 1 bin = 1 vote (anti biais densité)
+    - z dans bin = percentile haut (surface)
     """
     x = sl[:, 0]
+    z = sl[:, 2]
     xmin, xmax = np.percentile(x, [2, 98])
     if xmax - xmin < 1e-6:
-        return None
+        return None, None
 
-    nbins = max(30, int(np.ceil((xmax - xmin) / cell_cm)))
+    nbins = max(35, int(np.ceil((xmax - xmin) / cell_cm)))
     edges = np.linspace(xmin, xmax, nbins + 1)
 
-    centers = []
+    xc, zc = [], []
     for b in range(nbins):
         m = (x >= edges[b]) & (x < edges[b + 1])
-        if np.count_nonzero(m) >= min_pts_per_bin:
-            centers.append(0.5 * (edges[b] + edges[b + 1]))
+        if np.count_nonzero(m) < min_pts_per_bin:
+            continue
+        xc.append(0.5 * (edges[b] + edges[b + 1]))
+        zc.append(float(np.percentile(z[m], z_percentile)))
 
-    if len(centers) < 10:
-        return None
-    return np.array(centers, dtype=float)
+    if len(xc) < 12:
+        return None, None
 
-def midline_from_bins(xc, q=12):
+    xc = np.array(xc, dtype=float)
+    zc = np.array(zc, dtype=float)
+    o = np.argsort(xc)
+    return xc[o], zc[o]
+
+def midline_from_profile(xc, zc, q_edge=10):
     """
-    Milieu robuste entre bords détectés (bins):
-      x_mid = (Pq + P(100-q))/2
+    Milieu entre bords (sur bins), pas une moyenne de points.
     """
-    xl = float(np.percentile(xc, q))
-    xr = float(np.percentile(xc, 100 - q))
-    return 0.5 * (xl + xr)
+    xl = float(np.percentile(xc, q_edge))
+    xr = float(np.percentile(xc, 100 - q_edge))
+    x_mid = 0.5 * (xl + xr)
+    z_mid = float(np.interp(x_mid, xc, zc))
+    return x_mid, z_mid
 
-def pick_spinous_proxy(sl, x_mid, band_cm=3.0, z_quantile_for_surface=92):
-    """
-    Proxy apophyse:
-    - Restriction à une bande centrale +/- band_cm autour de x_mid
-    - Garde seulement la "surface" via quantile haut de Z
-    - Prend le max Z (plus postérieur)
-    """
-    x = sl[:, 0]
-    band = (x >= x_mid - band_cm) & (x <= x_mid + band_cm)
-    slb = sl[band] if np.count_nonzero(band) >= 25 else sl
-
-    zthr = np.percentile(slb[:, 2], z_quantile_for_surface)
-    surf = slb[slb[:, 2] >= zthr]
-    use = surf if surf.shape[0] >= 15 else slb
-
-    i = int(np.argmax(use[:, 2]))
-    x0 = float(use[i, 0])
-    z0 = float(np.percentile(use[:, 2], 90))
-    return x0, z0
-
-def extract_spine_spinous(
+def extract_spine_midline_back(
     pts,
-    remove_shoulders=True,
-    band_cm=3.0,
+    remove_lateral_outliers=True,
     cell_cm=0.45,
+    z_percentile=95,
+    q_edge=10,
     y_low=10,
     y_high=92,
     n_slices_min=140,
     n_slices_max=240,
 ):
     """
-    Extraction apophyses épineuses (robuste + anti densité):
-    1) rotation XZ
-    2) tranches Y
-    3) midline density-free via bins X (milieu entre bords)
-    4) apophyse proxy = max Z dans bande centrale
+    Extraction "ligne médiane dos" :
+    - rotation XZ
+    - tranches Y
+    - profil surface z(x) binned (density-free)
+    - bords sur xc -> x_mid
+    - z_mid = z(x_mid) via interpolation profil
     """
     R = estimate_rotation_xz(pts)
     pr = apply_rotation_xz(pts, R)
@@ -256,32 +236,39 @@ def extract_spine_spinous(
 
     for i in range(len(edges_y) - 1):
         sl = pr[(y >= edges_y[i]) & (y < edges_y[i + 1])]
-        if sl.shape[0] < 40:
+        if sl.shape[0] < 60:
             continue
 
-        # "Remove shoulders" version soft: enlève extrêmes latéraux (bras/artefacts)
-        # (pas de filtrage fort en Z, sinon on casse la médiane)
-        if remove_shoulders:
+        # retire extrêmes latéraux (bras/artefacts), sans utiliser de moyenne
+        if remove_lateral_outliers:
             x = sl[:, 0]
             xl, xr = np.percentile(x, [2, 98])
             sl = sl[(x >= xl) & (x <= xr)]
-            if sl.shape[0] < 30:
+            if sl.shape[0] < 40:
                 continue
 
-        xc = x_bins_present(sl, cell_cm=cell_cm, min_pts_per_bin=3)
+        xc, zc = slice_profile_surface_binned(
+            sl, cell_cm=cell_cm, z_percentile=z_percentile, min_pts_per_bin=3
+        )
         if xc is None:
             continue
 
-        x_mid = midline_from_bins(xc, q=12)
-        x0, z0 = pick_spinous_proxy(sl, x_mid, band_cm=band_cm, z_quantile_for_surface=92)
-        y_mid = float(np.median(sl[:, 1]))  # médiane (pas moyenne)
+        # lissage léger du profil (sur bins)
+        if len(zc) >= 11:
+            zc_s = savgol_filter(zc, 11, 2)
+        else:
+            zc_s = zc
+
+        x0, z0 = midline_from_profile(xc, zc_s, q_edge=q_edge)
+        y_mid = float(np.median(sl[:, 1]))  # médiane, pas moyenne
 
         # continuité douce (pas trop tôt)
-        if prev_x is not None and len(spine) > 12:
-            if abs(x0 - prev_x) > 2.5:
-                x0 = prev_x
-        prev_x = x0
+        if prev_x is not None and len(spine) > 12 and abs(x0 - prev_x) > 2.5:
+            x0 = prev_x
+            # z0 recalculé au centre imposé
+            z0 = float(np.interp(x0, xc, zc_s))
 
+        prev_x = x0
         spine.append([x0, y_mid, z0])
 
     if len(spine) == 0:
@@ -305,10 +292,11 @@ with st.sidebar:
     prenom = st.text_input("Prénom", "Jean")
     st.divider()
 
-    st.subheader("🎯 Ciblage apophyses")
-    remove_shoulders = st.toggle("Limiter artefacts latéraux (bras/épaules)", True)
-    band_cm = st.slider("Bande centrale (± cm)", 1.5, 6.0, 3.0, step=0.1)
+    st.subheader("🧭 Ligne médiane dos")
+    remove_lat = st.toggle("Limiter artefacts latéraux (bras)", True)
     cell_cm = st.slider("Taille bin X (cm)", 0.25, 1.00, 0.45, step=0.05)
+    z_perc = st.slider("Surface dos (percentile Z)", 85, 99, 95, step=1)
+    q_edge = st.slider("Bords (quantile X)", 5, 20, 10, step=1)
 
     st.divider()
     st.subheader("🧽 Lissage")
@@ -320,7 +308,7 @@ with st.sidebar:
     st.divider()
     ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
 
-st.title("🦴 SpineScan Pro — Apophyses")
+st.title("🦴 SpineScan Pro — Ligne médiane dos")
 
 if ply_file:
     if st.button("⚙️ LANCER L'ANALYSE BIOMÉCANIQUE"):
@@ -330,43 +318,27 @@ if ply_file:
         mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
         pts = pts[mask]
 
-        # centrage global X (affichage uniquement)
+        # centrage global X (affichage uniquement, OK)
         pts[:, 0] -= np.median(pts[:, 0])
 
-        # extraction apophyses (anti densité)
-        spine = extract_spine_spinous(
+        # extraction ligne médiane dos (density-free)
+        spine = extract_spine_midline_back(
             pts,
-            remove_shoulders=remove_shoulders,
-            band_cm=float(band_cm),
+            remove_lateral_outliers=remove_lat,
             cell_cm=float(cell_cm),
+            z_percentile=float(z_perc),
+            q_edge=int(q_edge),
         )
 
-        # fallback: relâche le soft shoulder/artefacts
-        if spine.shape[0] < 10 and remove_shoulders:
-            spine = extract_spine_spinous(
+        # fallback soft: relâche artefacts latéraux
+        if spine.shape[0] < 10 and remove_lat:
+            spine = extract_spine_midline_back(
                 pts,
-                remove_shoulders=False,
-                band_cm=float(band_cm),
+                remove_lateral_outliers=False,
                 cell_cm=float(cell_cm),
+                z_percentile=float(z_perc),
+                q_edge=int(q_edge),
             )
-
-        # dernier recours (toujours sans moyenne brute): médiane des bins X par tranche
-        if spine.shape[0] < 8:
-            y = pts[:, 1]
-            slices = np.linspace(np.percentile(y, 10), np.percentile(y, 92), 90)
-            tmp_sp = []
-            for i in range(len(slices) - 1):
-                sl = pts[(y >= slices[i]) & (y < slices[i + 1])]
-                if sl.shape[0] < 30:
-                    continue
-                xc = x_bins_present(sl, cell_cm=float(cell_cm), min_pts_per_bin=3)
-                if xc is None:
-                    continue
-                x0 = float(np.median(xc))
-                y0 = float(np.median(sl[:, 1]))
-                z0 = float(np.percentile(sl[:, 2], 90))
-                tmp_sp.append([x0, y0, z0])
-            spine = np.array(tmp_sp, dtype=float) if len(tmp_sp) else np.empty((0, 3), dtype=float)
 
         if spine.shape[0] == 0:
             st.error("Impossible d'extraire une courbe (scan trop incomplet).")
@@ -387,7 +359,7 @@ if ply_file:
         fig_f, ax_f = plt.subplots(figsize=(2.2, 4))
         ax_f.scatter(pts[:, 0], pts[:, 1], s=0.2, alpha=0.08, color="gray")
         ax_f.plot(spine[:, 0], spine[:, 1], "red", linewidth=2.6)
-        ax_f.set_title("Frontale (apophyses proxy)", fontsize=9)
+        ax_f.set_title("Frontale (ligne médiane dos)", fontsize=9)
         ax_f.axis("off")
         fig_f.savefig(img_f_p, bbox_inches="tight", dpi=160)
 
@@ -406,19 +378,16 @@ if ply_file:
         c2.pyplot(fig_s)
 
         st.write("### 📋 Synthèse des résultats")
-        st.markdown(
-            f"""
-            <div class="result-box">
-                <p><b>📏 Flèche Dorsale :</b> <span class="value-text">{fd:.2f} cm</span></p>
-                <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
-                <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
-                <div class="disclaimer">
-                    Extraction ciblée apophyses (proxy): midline via bins X (anti-biais densité) + max Z dans bande centrale ±{band_cm:.1f} cm.
-                </div>
+        st.markdown(f"""
+        <div class="result-box">
+            <p><b>📏 Flèche Dorsale :</b> <span class="value-text">{fd:.2f} cm</span></p>
+            <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
+            <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
+            <div class="disclaimer">
+                Ligne médiane dos = milieu entre bords (bins X, anti-biais densité) + z(x_mid) interpolé sur profil surface (Z p{int(z_perc)}).
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        </div>
+        """, unsafe_allow_html=True)
 
         res = {"fd": fd, "fl": fl, "dev_f": dev_f}
         pdf_path = export_pdf_pro({"nom": nom, "prenom": prenom}, res, img_f_p, img_s_p)
