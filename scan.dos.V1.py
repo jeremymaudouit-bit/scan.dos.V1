@@ -18,13 +18,7 @@ st.set_page_config(page_title="SpineScan Pro 3D", layout="wide")
 st.markdown("""
     <style>
     .main { background-color: #f8f9fc; }
-    .result-box {
-        background-color: #ffffff;
-        padding: 14px;
-        border-radius: 10px;
-        border: 1px solid #e0e0e0;
-        margin-bottom: 10px;
-    }
+    .result-box { background-color:#fff; padding:14px; border-radius:10px; border:1px solid #e0e0e0; margin-bottom:10px; }
     .value-text { font-size: 1.1rem; font-weight: bold; color: #2c3e50; }
     .stButton>button { background-color: #2c3e50; color: white; width: 100%; border-radius: 8px; font-weight: bold; }
     .disclaimer { font-size: 0.82rem; color: #555; font-style: italic; margin-top: 10px; border-left: 3px solid #ccc; padding-left: 10px;}
@@ -97,7 +91,7 @@ def compute_sagittal_arrow_lombaire_v2(spine_cm):
     return fd, fl, vertical_z
 
 # ==============================
-# LISSAGE (slider + fort)
+# LISSAGE
 # ==============================
 def median_filter_1d(a, k):
     a = np.asarray(a, dtype=float)
@@ -117,7 +111,7 @@ def median_filter_1d(a, k):
         out[i] = np.median(a[lo:hi])
     return out
 
-def smooth_spine(spine, window=81, strong=True, median_k=11):
+def smooth_spine(spine, window=91, strong=True, median_k=11):
     if spine.shape[0] < 7:
         return spine
     out = spine.copy()
@@ -147,110 +141,144 @@ def smooth_spine(spine, window=81, strong=True, median_k=11):
     return out
 
 # ==============================
-# ROTATION CORRECTION (XZ) + AXE PAR COURBURE
+# ROTATION CORRECTION
 # ==============================
 def estimate_rotation_xz(pts):
-    """Estime une rotation globale autour de Y (plan XZ) pour redresser le tronc."""
     y = pts[:, 1]
     mid = (y > np.percentile(y, 30)) & (y < np.percentile(y, 70))
     pts_mid = pts[mid] if np.count_nonzero(mid) > 200 else pts
-
     XZ = pts_mid[:, [0, 2]]
     XZ = XZ - np.mean(XZ, axis=0)
-
     _, _, Vt = np.linalg.svd(XZ, full_matrices=False)
     angle = float(np.arctan2(Vt[0, 1], Vt[0, 0]))
     c, s = np.cos(-angle), np.sin(-angle)
-    R = np.array([[c, -s],
-                  [s,  c]], dtype=float)
-    return R
+    return np.array([[c, -s], [s, c]], dtype=float)
 
 def apply_rotation_xz(pts, R):
     XZ_rot = pts[:, [0, 2]] @ R.T
     return np.column_stack([XZ_rot[:, 0], pts[:, 1], XZ_rot[:, 1]])
 
-def extract_spine_by_curvature(pts, remove_shoulders=True):
-    """
-    Extraction type "ligne des épineuses":
-    - corrige rotation XZ
-    - par tranche Y: construit un profil z(x) (dos)
-    - trouve le point le plus concave (min dérivée seconde)
-    -> beaucoup moins influencé par muscles/densité
-    """
+# ==============================
+# EXTRACTION 3 NIVEAUX (A/B/C)
+# ==============================
+def symmetry_center_1d(xc, zc):
+    if len(xc) < 10:
+        return float(np.median(xc))
+    xmin, xmax = float(np.min(xc)), float(np.max(xc))
+    span = xmax - xmin
+    a = xmin + 0.12 * span
+    b = xmax - 0.12 * span
+    if b <= a:
+        return float(np.median(xc))
 
-    # 1) redresser
+    candidates = np.linspace(a, b, 25)
+    best_c, best_cost = None, np.inf
+    for c in candidates:
+        umax = min(c - xmin, xmax - c)
+        if umax <= 0:
+            continue
+        us = np.linspace(0, umax, 20)
+        zL = np.interp(c - us, xc, zc)
+        zR = np.interp(c + us, xc, zc)
+        cost = float(np.mean(np.abs(zR - zL)))
+        if cost < best_cost:
+            best_cost, best_c = cost, c
+    return float(best_c if best_c is not None else np.median(xc))
+
+def slice_profile_surface(sl, cell_cm=0.5, z_percentile=95):
+    """Convertit points -> profil surface z(x) en bins (anti densité)."""
+    x = sl[:, 0]
+    z = sl[:, 2]
+    xmin, xmax = np.percentile(x, [2, 98])
+    if xmax - xmin < 1e-6:
+        return None, None
+
+    nbins = max(20, int(np.ceil((xmax - xmin) / cell_cm)))
+    edges = np.linspace(xmin, xmax, nbins + 1)
+
+    xc, zc = [], []
+    for b in range(nbins):
+        m = (x >= edges[b]) & (x < edges[b + 1])
+        if np.count_nonzero(m) < 3:
+            continue
+        xc.append(0.5 * (edges[b] + edges[b + 1]))
+        zc.append(float(np.percentile(z[m], z_percentile)))
+
+    if len(xc) < 10:
+        return None, None
+
+    xc = np.array(xc, dtype=float)
+    zc = np.array(zc, dtype=float)
+    o = np.argsort(xc)
+    return xc[o], zc[o]
+
+def extract_spine_robust(pts, remove_shoulders=True):
+    """
+    Extraction robuste:
+    - redresse XZ
+    - tranches Y adaptatives
+    - A: courbure (concavité)
+    - B: symétrie profil
+    - C: quantiles (25-75)
+    -> ne bloque pas
+    """
     R = estimate_rotation_xz(pts)
     pts_r = apply_rotation_xz(pts, R)
 
     y = pts_r[:, 1]
     y0 = np.percentile(y, 10)
     y1 = np.percentile(y, 92)
-    slices = np.linspace(y0, y1, 140)
+
+    # adaptatif: plus le scan est grand, plus on met de tranches
+    n_slices = int(np.clip((pts_r.shape[0] // 3000) + 120, 120, 220))
+    slices = np.linspace(y0, y1, n_slices)
 
     spine = []
     prev_x = None
 
+    # bins adaptatifs (plus de points -> bins plus fins)
+    cell_cm = float(np.clip(0.25 + 20000 / max(pts_r.shape[0], 1) * 0.25, 0.25, 0.8))
+
     for i in range(len(slices) - 1):
         sl = pts_r[(y >= slices[i]) & (y < slices[i + 1])]
-        if sl.shape[0] < 40:
+        if sl.shape[0] < 20:
             continue
 
-        x = sl[:, 0]
-        z = sl[:, 2]
-
-        # option épaules / relief haut: ne garder que la zone dorsale (z haut)
+        # option épaules: garder seulement le dos (z haut) mais sans tuer la tranche
         if remove_shoulders:
-            thr = np.percentile(z, 80)
-            m = z >= thr
-            if np.count_nonzero(m) > 20:
-                x = x[m]
-                z = z[m]
+            thr = np.percentile(sl[:, 2], 75)
+            m = sl[:, 2] >= thr
+            if np.count_nonzero(m) >= 20:
+                sl = sl[m]
 
-        if x.size < 20:
-            continue
+        # --- profil surface (anti densité) ---
+        xc, zc = slice_profile_surface(sl, cell_cm=cell_cm, z_percentile=95)
 
-        # profil z(x) : regrouper par bins en x pour neutraliser densité
-        xmin, xmax = np.percentile(x, [2, 98])
-        if xmax - xmin < 1e-6:
-            continue
+        # fallback C direct (quantiles) si pas de profil
+        if xc is None:
+            x0 = float(0.5 * (np.percentile(sl[:, 0], 25) + np.percentile(sl[:, 0], 75)))
+        else:
+            # lissage du profil
+            if len(zc) >= 11:
+                zc_s = savgol_filter(zc, 11, 2)
+            else:
+                zc_s = zc
 
-        cell_cm = 0.4  # 4 mm fixe (robuste)
-        nbins = max(25, int(np.ceil((xmax - xmin) / cell_cm)))
-        edges = np.linspace(xmin, xmax, nbins + 1)
-
-        xc, zc = [], []
-        for b in range(nbins):
-            mb = (x >= edges[b]) & (x < edges[b + 1])
-            if np.count_nonzero(mb) < 4:
-                continue
-            xc.append(0.5 * (edges[b] + edges[b + 1]))
-            zc.append(float(np.percentile(z[mb], 95)))
-
-        if len(xc) < 12:
-            continue
-
-        xc = np.array(xc, dtype=float)
-        zc = np.array(zc, dtype=float)
-
-        # lissage du profil
-        o = np.argsort(xc)
-        xc, zc = xc[o], zc[o]
-        if len(zc) >= 11:
-            zc = savgol_filter(zc, 11, 2)
-
-        # dérivée seconde
-        dz = np.gradient(zc, xc)
-        d2z = np.gradient(dz, xc)
-
-        # point le plus concave (candidat ligne rachidienne)
-        idx = int(np.argmin(d2z))
-        x0 = float(xc[idx])
+            # --- A: courbure ---
+            try:
+                dz = np.gradient(zc_s, xc)
+                d2z = np.gradient(dz, xc)
+                idx = int(np.argmin(d2z))
+                x0 = float(xc[idx])
+            except Exception:
+                # --- B: symétrie ---
+                x0 = symmetry_center_1d(xc, zc_s)
 
         y_mid = float(np.mean(sl[:, 1]))
-        z0 = float(np.percentile(z, 90))
+        z0 = float(np.percentile(sl[:, 2], 90))
 
-        # continuité
-        if prev_x is not None and abs(x0 - prev_x) > 1.5:
+        # continuité douce
+        if prev_x is not None and abs(x0 - prev_x) > 1.8:
             x0 = prev_x
         prev_x = x0
 
@@ -262,8 +290,7 @@ def extract_spine_by_curvature(pts, remove_shoulders=True):
     spine = np.array(spine, dtype=float)
     spine = spine[np.argsort(spine[:, 1])]
 
-    # 2) retour repère original
-    # on avait: XZ_rot = XZ @ R.T -> retour = XZ_rot @ R
+    # retour repère original
     XZ_back = spine[:, [0, 2]] @ R
     spine[:, 0] = XZ_back[:, 0]
     spine[:, 2] = XZ_back[:, 1]
@@ -293,31 +320,50 @@ st.title("🦴 SpineScan Pro")
 
 if ply_file:
     if st.button("⚙️ LANCER L'ANALYSE BIOMÉCANIQUE"):
-        # --- LOAD ---
-        pts = load_ply_numpy(ply_file) * 0.1  # mm -> cm (comme ton code original)
+        pts = load_ply_numpy(ply_file) * 0.1  # mm -> cm comme au début
 
-        # --- filtre Y léger ---
+        # nettoyage Y
         mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
         pts = pts[mask]
 
-        # --- centrage X global (affichage stable) ---
+        # centrage global X (affichage)
         pts[:, 0] -= np.median(pts[:, 0])
 
-        # --- extraction colonne (courbure) ---
-        spine = extract_spine_by_curvature(pts, remove_shoulders=remove_shoulders)
-        if spine.shape[0] < 10:
-            st.error("Extraction insuffisante. Essaie de désactiver 'Supprimer épaules' ou améliore le scan.")
+        # extraction robuste (A/B/C)
+        spine = extract_spine_robust(pts, remove_shoulders=remove_shoulders)
+
+        # si trop peu de points, on relâche automatiquement
+        if spine.shape[0] < 10 and remove_shoulders:
+            spine = extract_spine_robust(pts, remove_shoulders=False)
+
+        if spine.shape[0] < 8:
+            # dernier recours: axe centre global (ne bloque pas)
+            y = pts[:, 1]
+            slices = np.linspace(np.percentile(y, 10), np.percentile(y, 92), 80)
+            tmp_sp = []
+            for i in range(len(slices) - 1):
+                sl = pts[(y >= slices[i]) & (y < slices[i + 1])]
+                if sl.shape[0] < 10:
+                    continue
+                x0 = float(np.median(sl[:, 0]))
+                y0 = float(np.mean(sl[:, 1]))
+                z0 = float(np.percentile(sl[:, 2], 90))
+                tmp_sp.append([x0, y0, z0])
+            spine = np.array(tmp_sp, dtype=float) if len(tmp_sp) else np.empty((0, 3), dtype=float)
+
+        if spine.shape[0] == 0:
+            st.error("Impossible d'extraire une courbe (scan trop incomplet).")
             st.stop()
 
-        # --- lissage ---
+        # lissage
         if do_smooth:
             spine = smooth_spine(spine, window=smooth_window, strong=strong_smooth, median_k=median_k)
 
-        # --- métriques ---
+        # métriques
         fd, fl, vertical_z = compute_sagittal_arrow_lombaire_v2(spine)
         dev_f = float(np.max(np.abs(spine[:, 0]))) if spine.size else 0.0
 
-        # --- images ---
+        # images
         tmp = tempfile.gettempdir()
         img_f_p, img_s_p = os.path.join(tmp, "f.png"), os.path.join(tmp, "s.png")
 
@@ -337,7 +383,6 @@ if ply_file:
         ax_s.axis("off")
         fig_s.savefig(img_s_p, bbox_inches="tight", dpi=160)
 
-        # --- affichage ---
         st.write("### 📈 Analyse Visuelle")
         _, c1, c2, _ = st.columns([1, 1, 1, 1])
         c1.pyplot(fig_f)
@@ -350,12 +395,12 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Frontal : extraction par <b>courbure</b> du profil dorsal (approx. ligne des épineuses) + redressement automatique (rotation XZ).
+                Extraction robuste multi-stratégies (courbure ➜ symétrie ➜ quantiles) + correction rotation XZ.
+                Aucun blocage même si le scan est irrégulier.
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # --- PDF ---
         res = {"fd": fd, "fl": fl, "dev_f": dev_f}
         pdf_path = export_pdf_pro({"nom": nom, "prenom": prenom}, res, img_f_p, img_s_p)
 
