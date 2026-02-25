@@ -141,7 +141,7 @@ def smooth_spine(spine, window=91, strong=True, median_k=11):
     return out
 
 # ==============================
-# ROTATION CORRECTION
+# ROTATION CORRECTION (inchangée)
 # ==============================
 def estimate_rotation_xz(pts):
     y = pts[:, 1]
@@ -159,7 +159,7 @@ def apply_rotation_xz(pts, R):
     return np.column_stack([XZ_rot[:, 0], pts[:, 1], XZ_rot[:, 1]])
 
 # ==============================
-# EXTRACTION 3 NIVEAUX (A/B/C)
+# SYMMETRY (garde ton idée, mais utilisée sur bins)
 # ==============================
 def symmetry_center_1d(xc, zc):
     if len(xc) < 10:
@@ -171,13 +171,13 @@ def symmetry_center_1d(xc, zc):
     if b <= a:
         return float(np.median(xc))
 
-    candidates = np.linspace(a, b, 25)
+    candidates = np.linspace(a, b, 31)
     best_c, best_cost = None, np.inf
     for c in candidates:
         umax = min(c - xmin, xmax - c)
         if umax <= 0:
             continue
-        us = np.linspace(0, umax, 20)
+        us = np.linspace(0, umax, 30)
         zL = np.interp(c - us, xc, zc)
         zR = np.interp(c + us, xc, zc)
         cost = float(np.mean(np.abs(zR - zL)))
@@ -185,15 +185,23 @@ def symmetry_center_1d(xc, zc):
             best_cost, best_c = cost, c
     return float(best_c if best_c is not None else np.median(xc))
 
-def slice_profile_surface(sl, cell_cm=0.5, z_percentile=95):
-    """Convertit points -> profil surface z(x) en bins (anti densité)."""
+# ==============================
+# DENSITY-FREE PROFILE (anti biais densité)
+# ==============================
+def slice_profile_surface_binned(sl, cell_cm=0.5, z_percentile=95):
+    """
+    Crée un profil z(x) en bins réguliers en X.
+    Chaque bin compte 1 fois -> pas de biais densité.
+    On prend un percentile haut de Z dans chaque bin (surface du dos).
+    """
     x = sl[:, 0]
     z = sl[:, 2]
+
     xmin, xmax = np.percentile(x, [2, 98])
     if xmax - xmin < 1e-6:
         return None, None
 
-    nbins = max(20, int(np.ceil((xmax - xmin) / cell_cm)))
+    nbins = max(30, int(np.ceil((xmax - xmin) / cell_cm)))
     edges = np.linspace(xmin, xmax, nbins + 1)
 
     xc, zc = [], []
@@ -204,7 +212,7 @@ def slice_profile_surface(sl, cell_cm=0.5, z_percentile=95):
         xc.append(0.5 * (edges[b] + edges[b + 1]))
         zc.append(float(np.percentile(z[m], z_percentile)))
 
-    if len(xc) < 10:
+    if len(xc) < 12:
         return None, None
 
     xc = np.array(xc, dtype=float)
@@ -212,15 +220,26 @@ def slice_profile_surface(sl, cell_cm=0.5, z_percentile=95):
     o = np.argsort(xc)
     return xc[o], zc[o]
 
-def extract_spine_robust(pts, remove_shoulders=True):
+def robust_center_from_bins(xc):
     """
-    Extraction robuste:
-    - redresse XZ
-    - tranches Y adaptatives
-    - A: courbure (concavité)
-    - B: symétrie profil
-    - C: quantiles (25-75)
-    -> ne bloque pas
+    Centre robuste "density-free" : médiane des centres de bins valides.
+    (chaque bin = 1 vote)
+    """
+    if xc is None or len(xc) == 0:
+        return None
+    return float(np.median(xc))
+
+# ==============================
+# EXTRACTION CORRIGÉE (sans biais densité)
+# ==============================
+def extract_spine_density_free(pts, remove_shoulders=True):
+    """
+    Extraction robuste + anti-biais densité :
+    - rotation XZ
+    - slices Y
+    - profil z(x) en bins X (density-free)
+    - centre par symétrie du profil (ou médiane bins)
+    - Z = percentile haut de la tranche
     """
     R = estimate_rotation_xz(pts)
     pts_r = apply_rotation_xz(pts, R)
@@ -229,57 +248,75 @@ def extract_spine_robust(pts, remove_shoulders=True):
     y0 = np.percentile(y, 10)
     y1 = np.percentile(y, 92)
 
-    # adaptatif: plus le scan est grand, plus on met de tranches
-    n_slices = int(np.clip((pts_r.shape[0] // 3000) + 120, 120, 220))
+    n_slices = int(np.clip((pts_r.shape[0] // 3000) + 140, 140, 240))
     slices = np.linspace(y0, y1, n_slices)
 
     spine = []
     prev_x = None
 
-    # bins adaptatifs (plus de points -> bins plus fins)
-    cell_cm = float(np.clip(0.25 + 20000 / max(pts_r.shape[0], 1) * 0.25, 0.25, 0.8))
+    # bins X : adapte selon densité globale, mais reste borné
+    cell_cm = float(np.clip(0.35 + 25000 / max(pts_r.shape[0], 1) * 0.20, 0.25, 0.8))
 
     for i in range(len(slices) - 1):
         sl = pts_r[(y >= slices[i]) & (y < slices[i + 1])]
-        if sl.shape[0] < 20:
+        if sl.shape[0] < 30:
             continue
 
-        # option épaules: garder seulement le dos (z haut) mais sans tuer la tranche
+        # "supprimer épaules" mais sans détruire la symétrie :
+        # on garde le dos (z haut) avec un seuil un peu plus haut, et fallback si trop peu.
         if remove_shoulders:
-            thr = np.percentile(sl[:, 2], 75)
+            thr = np.percentile(sl[:, 2], 80)
             m = sl[:, 2] >= thr
-            if np.count_nonzero(m) >= 20:
-                sl = sl[m]
-
-        # --- profil surface (anti densité) ---
-        xc, zc = slice_profile_surface(sl, cell_cm=cell_cm, z_percentile=95)
-
-        # fallback C direct (quantiles) si pas de profil
-        if xc is None:
-            x0 = float(0.5 * (np.percentile(sl[:, 0], 25) + np.percentile(sl[:, 0], 75)))
+            if np.count_nonzero(m) >= 40:
+                sl_use = sl[m]
+            else:
+                sl_use = sl
         else:
-            # lissage du profil
+            sl_use = sl
+
+        # profil en bins (anti densité)
+        xc, zc = slice_profile_surface_binned(sl_use, cell_cm=cell_cm, z_percentile=95)
+
+        if xc is None:
+            # fallback density-free : bins sur X sans z(x)
+            # on fait une discrétisation X et on prend la médiane des bins non vides
+            x = sl_use[:, 0]
+            xmin, xmax = np.percentile(x, [2, 98])
+            if xmax - xmin < 1e-6:
+                continue
+            nb = max(25, int(np.ceil((xmax - xmin) / cell_cm)))
+            edges = np.linspace(xmin, xmax, nb + 1)
+            centers = []
+            for b in range(nb):
+                m = (x >= edges[b]) & (x < edges[b + 1])
+                if np.count_nonzero(m) >= 3:
+                    centers.append(0.5 * (edges[b] + edges[b + 1]))
+            if len(centers) < 8:
+                continue
+            x0 = float(np.median(np.array(centers)))
+        else:
+            # léger lissage du profil (sur bins, donc ok)
             if len(zc) >= 11:
                 zc_s = savgol_filter(zc, 11, 2)
             else:
                 zc_s = zc
 
-            # --- A: courbure ---
-            try:
-                dz = np.gradient(zc_s, xc)
-                d2z = np.gradient(dz, xc)
-                idx = int(np.argmin(d2z))
-                x0 = float(xc[idx])
-            except Exception:
-                # --- B: symétrie ---
-                x0 = symmetry_center_1d(xc, zc_s)
+            # centre par symétrie (le plus “médian” géométriquement)
+            x0 = symmetry_center_1d(xc, zc_s)
 
-        y_mid = float(np.mean(sl[:, 1]))
-        z0 = float(np.percentile(sl[:, 2], 90))
+            # si la symétrie donne un truc bizarre, fallback médiane bins
+            if not np.isfinite(x0):
+                x0 = robust_center_from_bins(xc)
+            if x0 is None:
+                continue
 
-        # continuité douce
-        if prev_x is not None and abs(x0 - prev_x) > 1.8:
-            x0 = prev_x
+        y_mid = float(np.median(sl_use[:, 1]))  # médiane (pas moyenne)
+        z0 = float(np.percentile(sl_use[:, 2], 90))
+
+        # continuité : ne pas verrouiller trop tôt
+        if prev_x is not None and len(spine) > 12:
+            if abs(x0 - prev_x) > 2.2:
+                x0 = prev_x
         prev_x = x0
 
         spine.append([x0, y_mid, z0])
@@ -320,33 +357,47 @@ st.title("🦴 SpineScan Pro")
 
 if ply_file:
     if st.button("⚙️ LANCER L'ANALYSE BIOMÉCANIQUE"):
-        pts = load_ply_numpy(ply_file) * 0.1  # mm -> cm comme au début
+        pts = load_ply_numpy(ply_file) * 0.1  # mm -> cm
 
         # nettoyage Y
         mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
         pts = pts[mask]
 
-        # centrage global X (affichage)
+        # centrage global X (affichage uniquement, OK)
         pts[:, 0] -= np.median(pts[:, 0])
 
-        # extraction robuste (A/B/C)
-        spine = extract_spine_robust(pts, remove_shoulders=remove_shoulders)
+        # extraction corrigée anti-biais densité
+        spine = extract_spine_density_free(pts, remove_shoulders=remove_shoulders)
 
-        # si trop peu de points, on relâche automatiquement
+        # si trop peu, relâche épaules
         if spine.shape[0] < 10 and remove_shoulders:
-            spine = extract_spine_robust(pts, remove_shoulders=False)
+            spine = extract_spine_density_free(pts, remove_shoulders=False)
 
         if spine.shape[0] < 8:
-            # dernier recours: axe centre global (ne bloque pas)
+            # dernier recours : density-free par bins X (pas moyenne)
             y = pts[:, 1]
-            slices = np.linspace(np.percentile(y, 10), np.percentile(y, 92), 80)
+            slices = np.linspace(np.percentile(y, 10), np.percentile(y, 92), 90)
             tmp_sp = []
             for i in range(len(slices) - 1):
                 sl = pts[(y >= slices[i]) & (y < slices[i + 1])]
-                if sl.shape[0] < 10:
+                if sl.shape[0] < 20:
                     continue
-                x0 = float(np.median(sl[:, 0]))
-                y0 = float(np.mean(sl[:, 1]))
+                x = sl[:, 0]
+                xmin, xmax = np.percentile(x, [2, 98])
+                if xmax - xmin < 1e-6:
+                    continue
+                cell = 0.6
+                nb = max(20, int(np.ceil((xmax - xmin) / cell)))
+                edges = np.linspace(xmin, xmax, nb + 1)
+                centers = []
+                for b in range(nb):
+                    m = (x >= edges[b]) & (x < edges[b + 1])
+                    if np.count_nonzero(m) >= 3:
+                        centers.append(0.5 * (edges[b] + edges[b + 1]))
+                if len(centers) < 8:
+                    continue
+                x0 = float(np.median(np.array(centers)))
+                y0 = float(np.median(sl[:, 1]))
                 z0 = float(np.percentile(sl[:, 2], 90))
                 tmp_sp.append([x0, y0, z0])
             spine = np.array(tmp_sp, dtype=float) if len(tmp_sp) else np.empty((0, 3), dtype=float)
@@ -395,8 +446,8 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Extraction robuste multi-stratégies (courbure ➜ symétrie ➜ quantiles) + correction rotation XZ.
-                Aucun blocage même si le scan est irrégulier.
+                Extraction anti-biais densité: profil en bins X (1 bin = 1 vote) + centre par symétrie.
+                Aucune moyenne des points bruts.
             </div>
         </div>
         """, unsafe_allow_html=True)
