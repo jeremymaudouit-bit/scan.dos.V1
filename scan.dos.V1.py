@@ -159,21 +159,16 @@ def apply_rotation_xz(pts, R):
     return np.column_stack([XZ_rot[:, 0], pts[:, 1], XZ_rot[:, 1]])
 
 # ==============================
-# LIGNE MÉDIANE DOS (density-free)
+# MIDLINE FULL BACK (density-free + fill gaps)
 # ==============================
-def slice_profile_surface_binned(sl, cell_cm=0.5, z_percentile=95, min_pts_per_bin=3):
-    """
-    Profil surface z(x) en bins X :
-    - 1 bin = 1 vote (anti biais densité)
-    - z dans bin = percentile haut (surface)
-    """
+def slice_profile_surface_binned(sl, cell_cm=0.5, z_percentile=93, min_pts_per_bin=2):
     x = sl[:, 0]
     z = sl[:, 2]
     xmin, xmax = np.percentile(x, [2, 98])
     if xmax - xmin < 1e-6:
         return None, None
 
-    nbins = max(35, int(np.ceil((xmax - xmin) / cell_cm)))
+    nbins = max(28, int(np.ceil((xmax - xmin) / cell_cm)))
     edges = np.linspace(xmin, xmax, nbins + 1)
 
     xc, zc = [], []
@@ -184,7 +179,7 @@ def slice_profile_surface_binned(sl, cell_cm=0.5, z_percentile=95, min_pts_per_b
         xc.append(0.5 * (edges[b] + edges[b + 1]))
         zc.append(float(np.percentile(z[m], z_percentile)))
 
-    if len(xc) < 12:
+    if len(xc) < 10:
         return None, None
 
     xc = np.array(xc, dtype=float)
@@ -192,35 +187,23 @@ def slice_profile_surface_binned(sl, cell_cm=0.5, z_percentile=95, min_pts_per_b
     o = np.argsort(xc)
     return xc[o], zc[o]
 
-def midline_from_profile(xc, zc, q_edge=10):
-    """
-    Milieu entre bords (sur bins), pas une moyenne de points.
-    """
+def midline_from_profile(xc, zc, q_edge=8):
     xl = float(np.percentile(xc, q_edge))
     xr = float(np.percentile(xc, 100 - q_edge))
     x_mid = 0.5 * (xl + xr)
     z_mid = float(np.interp(x_mid, xc, zc))
     return x_mid, z_mid
 
-def extract_spine_midline_back(
+def extract_spine_midline_full(
     pts,
     remove_lateral_outliers=True,
-    cell_cm=0.45,
-    z_percentile=95,
-    q_edge=10,
-    y_low=10,
-    y_high=92,
-    n_slices_min=140,
-    n_slices_max=240,
+    cell_cm=0.55,
+    z_percentile=93,
+    q_edge=8,
+    y_low=2,
+    y_high=98,
+    allow_fill_gaps=True,
 ):
-    """
-    Extraction "ligne médiane dos" :
-    - rotation XZ
-    - tranches Y
-    - profil surface z(x) binned (density-free)
-    - bords sur xc -> x_mid
-    - z_mid = z(x_mid) via interpolation profil
-    """
     R = estimate_rotation_xz(pts)
     pr = apply_rotation_xz(pts, R)
 
@@ -228,48 +211,59 @@ def extract_spine_midline_back(
     y0 = np.percentile(y, y_low)
     y1 = np.percentile(y, y_high)
 
-    n_slices = int(np.clip((pr.shape[0] // 3000) + 160, n_slices_min, n_slices_max))
+    # Plus de tranches pour couvrir tout le dos
+    n_slices = int(np.clip((pr.shape[0] // 2500) + 220, 200, 320))
     edges_y = np.linspace(y0, y1, n_slices)
 
     spine = []
     prev_x = None
+    prev_z = None
 
     for i in range(len(edges_y) - 1):
         sl = pr[(y >= edges_y[i]) & (y < edges_y[i + 1])]
-        if sl.shape[0] < 60:
+        y_mid = float(0.5 * (edges_y[i] + edges_y[i + 1]))
+
+        if sl.shape[0] < 25:
+            if allow_fill_gaps and prev_x is not None and prev_z is not None:
+                spine.append([prev_x, y_mid, prev_z])
             continue
 
-        # retire extrêmes latéraux (bras/artefacts), sans utiliser de moyenne
         if remove_lateral_outliers:
             x = sl[:, 0]
-            xl, xr = np.percentile(x, [2, 98])
+            xl, xr = np.percentile(x, [1.5, 98.5])
             sl = sl[(x >= xl) & (x <= xr)]
-            if sl.shape[0] < 40:
+            if sl.shape[0] < 20:
+                if allow_fill_gaps and prev_x is not None and prev_z is not None:
+                    spine.append([prev_x, y_mid, prev_z])
                 continue
 
-        xc, zc = slice_profile_surface_binned(
-            sl, cell_cm=cell_cm, z_percentile=z_percentile, min_pts_per_bin=3
-        )
+        # tentative 1 (cell_cm courant)
+        xc, zc = slice_profile_surface_binned(sl, cell_cm=cell_cm, z_percentile=z_percentile, min_pts_per_bin=2)
+
+        # tentative 2: bins plus larges si le haut est pauvre
         if xc is None:
+            xc, zc = slice_profile_surface_binned(sl, cell_cm=min(0.9, cell_cm * 1.5), z_percentile=z_percentile, min_pts_per_bin=2)
+
+        if xc is None:
+            if allow_fill_gaps and prev_x is not None and prev_z is not None:
+                spine.append([prev_x, y_mid, prev_z])
             continue
 
-        # lissage léger du profil (sur bins)
-        if len(zc) >= 11:
-            zc_s = savgol_filter(zc, 11, 2)
+        # lissage léger du profil
+        if len(zc) >= 9:
+            zc_s = savgol_filter(zc, 9, 2)
         else:
             zc_s = zc
 
         x0, z0 = midline_from_profile(xc, zc_s, q_edge=q_edge)
-        y_mid = float(np.median(sl[:, 1]))  # médiane, pas moyenne
 
-        # continuité douce (pas trop tôt)
-        if prev_x is not None and len(spine) > 12 and abs(x0 - prev_x) > 2.5:
+        # continuité douce (évite sauts énormes)
+        if prev_x is not None and abs(x0 - prev_x) > 3.0:
             x0 = prev_x
-            # z0 recalculé au centre imposé
             z0 = float(np.interp(x0, xc, zc_s))
 
-        prev_x = x0
-        spine.append([x0, y_mid, z0])
+        prev_x, prev_z = x0, z0
+        spine.append([x0, float(np.median(sl[:, 1])), float(z0)])
 
     if len(spine) == 0:
         return np.empty((0, 3), dtype=float)
@@ -292,11 +286,13 @@ with st.sidebar:
     prenom = st.text_input("Prénom", "Jean")
     st.divider()
 
-    st.subheader("🧭 Ligne médiane dos")
+    st.subheader("🧭 Ligne médiane dos (tout le dos)")
     remove_lat = st.toggle("Limiter artefacts latéraux (bras)", True)
-    cell_cm = st.slider("Taille bin X (cm)", 0.25, 1.00, 0.45, step=0.05)
-    z_perc = st.slider("Surface dos (percentile Z)", 85, 99, 95, step=1)
-    q_edge = st.slider("Bords (quantile X)", 5, 20, 10, step=1)
+    allow_fill = st.toggle("Remplir les manques (continuité)", True)
+
+    cell_cm = st.slider("Taille bin X (cm)", 0.30, 1.20, 0.55, step=0.05)
+    z_perc = st.slider("Surface dos (percentile Z)", 85, 99, 93, step=1)
+    q_edge = st.slider("Bords (quantile X)", 5, 20, 8, step=1)
 
     st.divider()
     st.subheader("🧽 Lissage")
@@ -308,58 +304,47 @@ with st.sidebar:
     st.divider()
     ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
 
-st.title("🦴 SpineScan Pro — Ligne médiane dos")
+st.title("🦴 SpineScan Pro — Ligne médiane dos (Full)")
 
 if ply_file:
     if st.button("⚙️ LANCER L'ANALYSE BIOMÉCANIQUE"):
         pts = load_ply_numpy(ply_file) * 0.1  # mm -> cm
 
-        # nettoyage Y
-        mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
+        # nettoyage Y (moins agressif pour garder tout le haut/bas)
+        mask = (pts[:, 1] > np.percentile(pts[:, 1], 1)) & (pts[:, 1] < np.percentile(pts[:, 1], 99))
         pts = pts[mask]
 
-        # centrage global X (affichage uniquement, OK)
+        # centrage global X (affichage uniquement)
         pts[:, 0] -= np.median(pts[:, 0])
 
-        # extraction ligne médiane dos (density-free)
-        spine = extract_spine_midline_back(
+        spine = extract_spine_midline_full(
             pts,
             remove_lateral_outliers=remove_lat,
             cell_cm=float(cell_cm),
             z_percentile=float(z_perc),
             q_edge=int(q_edge),
+            y_low=2,
+            y_high=98,
+            allow_fill_gaps=allow_fill,
         )
-
-        # fallback soft: relâche artefacts latéraux
-        if spine.shape[0] < 10 and remove_lat:
-            spine = extract_spine_midline_back(
-                pts,
-                remove_lateral_outliers=False,
-                cell_cm=float(cell_cm),
-                z_percentile=float(z_perc),
-                q_edge=int(q_edge),
-            )
 
         if spine.shape[0] == 0:
             st.error("Impossible d'extraire une courbe (scan trop incomplet).")
             st.stop()
 
-        # lissage
         if do_smooth:
             spine = smooth_spine(spine, window=smooth_window, strong=strong_smooth, median_k=median_k)
 
-        # métriques
         fd, fl, vertical_z = compute_sagittal_arrow_lombaire_v2(spine)
         dev_f = float(np.max(np.abs(spine[:, 0]))) if spine.size else 0.0
 
-        # images
         tmp = tempfile.gettempdir()
         img_f_p, img_s_p = os.path.join(tmp, "f.png"), os.path.join(tmp, "s.png")
 
         fig_f, ax_f = plt.subplots(figsize=(2.2, 4))
         ax_f.scatter(pts[:, 0], pts[:, 1], s=0.2, alpha=0.08, color="gray")
         ax_f.plot(spine[:, 0], spine[:, 1], "red", linewidth=2.6)
-        ax_f.set_title("Frontale (ligne médiane dos)", fontsize=9)
+        ax_f.set_title("Frontale (midline full)", fontsize=9)
         ax_f.axis("off")
         fig_f.savefig(img_f_p, bbox_inches="tight", dpi=160)
 
@@ -384,7 +369,8 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Ligne médiane dos = milieu entre bords (bins X, anti-biais densité) + z(x_mid) interpolé sur profil surface (Z p{int(z_perc)}).
+                Midline full-back : tranches Y 2→98%, profil surface binned (anti-biais densité),
+                milieu entre bords (q={q_edge}%) + remplissage des manques = {str(allow_fill)}.
             </div>
         </div>
         """, unsafe_allow_html=True)
