@@ -32,13 +32,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================
-# IO / PDF
+# IO
 # ==============================
 def load_ply_numpy(file):
     plydata = PlyData.read(file)
     v = plydata["vertex"]
     return np.vstack([v["x"], v["y"], v["z"]]).T.astype(float)
 
+# ==============================
+# PDF
+# ==============================
 def export_pdf_pro(patient_info, results, img_f, img_s):
     tmp = tempfile.gettempdir()
     path = os.path.join(tmp, "bilan_spine_pro.pdf")
@@ -79,16 +82,19 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
     return path
 
 # ==============================
-# HELPERS
+# Metrics (sagittal unchanged)
 # ==============================
 def compute_sagittal_arrow_lombaire_v2(spine_cm):
     y = spine_cm[:, 1]
     z = spine_cm[:, 2]
+
     idx_dorsal = int(np.argmax(z))
     z_dorsal = float(z[idx_dorsal])
     vertical_z = np.full_like(y, z_dorsal)
+
     idx_lombaire = int(np.argmin(z))
     z_lombaire = float(z[idx_lombaire])
+
     fd = 0.0
     fl = float(abs(z_lombaire - z_dorsal))
     return fd, fl, vertical_z
@@ -111,142 +117,148 @@ def smooth_spine(spine, smooth_val=25, poly=3):
     out[:, 2] = savgol_filter(out[:, 2], w, poly)
     return out
 
-def detect_vertical_axis(pts):
-    spans = []
-    for a in range(3):
-        q5, q95 = np.percentile(pts[:, a], [5, 95])
-        spans.append(q95 - q5)
-    return int(np.argmax(spans))
-
-def reorder_axes_to_make_y_vertical(pts, vertical_axis):
-    axes = [0, 1, 2]
-    axes.remove(vertical_axis)
-    order = [axes[0], vertical_axis, axes[1]]  # X, Y(vertical), Z
-    return pts[:, order], order
-
-def infer_scale_to_cm(pts):
+# =========================================================
+# ✅ FRONTAL FROM SCRATCH: "MOYENNE DE SURFACE" (pas points)
+# =========================================================
+def build_dorsal_surface_grid(pts_cm, cell_cm=0.3, z_percentile=95):
     """
-    Heuristique d'échelle :
-    - Si hauteur (amplitude axe vertical) ~ 1.5 à 2.2 => probablement mètres -> *100
-    - Si ~ 150 à 220 => probablement cm -> *1
-    - Si ~ 1500 à 2200 => probablement mm -> *0.1
+    Construit une surface du dos en grille (x,y)->z_surface.
+    Chaque cellule (x,y) a 1 valeur => poids surface uniforme (anti densité).
+
+    Retourne:
+      x_centers (nx,), y_centers (ny,), Z (ny,nx) avec np.nan si vide
     """
-    vax = detect_vertical_axis(pts)
-    q5, q95 = np.percentile(pts[:, vax], [5, 95])
-    height = float(q95 - q5)
+    x = pts_cm[:, 0]
+    y = pts_cm[:, 1]
+    z = pts_cm[:, 2]
 
-    # bornes larges pour ne pas casser
-    if 0.5 < height < 3.0:
-        return 100.0, "m → cm"
-    if 50.0 < height < 300.0:
-        return 1.0, "cm → cm"
-    if 500.0 < height < 3000.0:
-        return 0.1, "mm → cm"
-    # fallback : ne change rien
-    return 1.0, "échelle inconnue (×1)"
+    xmin, xmax = np.percentile(x, [1, 99])
+    ymin, ymax = np.percentile(y, [1, 99])
 
-def voxel_downsample_median(pts_cm, voxel_cm):
-    if pts_cm.shape[0] == 0:
-        return pts_cm
-    q = np.floor(pts_cm / voxel_cm).astype(np.int64)
-    key = q[:, 0] * 73856093 + q[:, 1] * 19349663 + q[:, 2] * 83492791
+    if xmax - xmin < 1e-6 or ymax - ymin < 1e-6:
+        return None
+
+    nx = max(20, int(np.ceil((xmax - xmin) / cell_cm)))
+    ny = max(40, int(np.ceil((ymax - ymin) / cell_cm)))
+
+    # indices de cellule
+    ix = np.clip(((x - xmin) / cell_cm).astype(int), 0, nx - 1)
+    iy = np.clip(((y - ymin) / cell_cm).astype(int), 0, ny - 1)
+
+    # regrouper par (iy, ix) via clé
+    key = iy * nx + ix
     order = np.argsort(key)
-    pts_sorted = pts_cm[order]
-    key_sorted = key[order]
-    boundaries = np.where(np.diff(key_sorted) != 0)[0] + 1
-    groups = np.split(pts_sorted, boundaries)
-    out = np.array([np.median(g, axis=0) for g in groups], dtype=float)
-    return out
+    key_s = key[order]
+    z_s = z[order]
 
-def profile_z_of_x(points, nbins=70):
-    if points.shape[0] < 20:
-        return None
-    x = points[:, 0]
-    z = points[:, 2]
-    xmin, xmax = np.percentile(x, [2, 98])
-    if xmax - xmin < 1e-6:
-        return np.array([np.median(x)]), np.array([np.median(z)])
-    edges = np.linspace(xmin, xmax, nbins + 1)
-    xc, zc = [], []
-    for i in range(nbins):
-        m = (x >= edges[i]) & (x < edges[i + 1])
-        if np.count_nonzero(m) < 4:
-            continue
-        xc.append(0.5 * (edges[i] + edges[i + 1]))
-        zc.append(float(np.median(z[m])))
-    if len(xc) < 6:
-        return None
-    xc = np.array(xc, dtype=float)
-    zc = np.array(zc, dtype=float)
-    w = min(7, len(zc) - 1)
-    if w % 2 == 0:
-        w -= 1
-    if w >= 5 and len(zc) > w:
-        zc = savgol_filter(zc, w, 2)
-    return xc, zc
+    # init grille
+    Z = np.full((ny, nx), np.nan, dtype=float)
 
-def symmetry_center_from_profile(xc, zc, n_candidates=21, trim=0.10):
-    if xc.shape[0] < 6:
+    # parcours groupes
+    splits = np.where(np.diff(key_s) != 0)[0] + 1
+    groups = np.split(z_s, splits)
+    keys_g = np.split(key_s, splits)
+
+    for k_arr, z_arr in zip(keys_g, groups):
+        k0 = int(k_arr[0])
+        gy = k0 // nx
+        gx = k0 % nx
+        # valeur de surface (dos): percentile élevé de z dans la cellule
+        Z[gy, gx] = float(np.percentile(z_arr, z_percentile))
+
+    x_centers = xmin + (np.arange(nx) + 0.5) * cell_cm
+    y_centers = ymin + (np.arange(ny) + 0.5) * cell_cm
+    return x_centers, y_centers, Z
+
+def symmetry_center_1d(xc, zc):
+    """
+    Trouve le centre c qui rend z(x) le plus symétrique.
+    """
+    if len(xc) < 10:
         return float(np.median(xc))
+
     xmin, xmax = float(xc.min()), float(xc.max())
     span = xmax - xmin
-    a = xmin + trim * span
-    b = xmax - trim * span
+    a = xmin + 0.10 * span
+    b = xmax - 0.10 * span
     if b <= a:
         return float(np.median(xc))
-    candidates = np.linspace(a, b, n_candidates)
-    best_c, best_cost = None, np.inf
+
+    candidates = np.linspace(a, b, 31)
+    best_c = None
+    best_cost = np.inf
+
     for c in candidates:
         umax = min(c - xmin, xmax - c)
         if umax <= 0:
             continue
-        us = np.linspace(0, umax, 21)
+        us = np.linspace(0, umax, 25)
         zL = np.interp(c - us, xc, zc)
         zR = np.interp(c + us, xc, zc)
         cost = float(np.mean(np.abs(zR - zL)))
         if cost < best_cost:
-            best_cost, best_c = cost, c
+            best_cost = cost
+            best_c = c
+
     return float(best_c if best_c is not None else np.median(xc))
 
-def build_spine_axis_symmetry(pts_cm, n_slices=90, back_percent=85, nbins=70):
+def frontal_centerline_from_surface(pts_cm, cell_cm=0.3, z_cell_percentile=95,
+                                    keep_top_percent_rows=35):
     """
-    Version qui NE BLOQUE PAS :
-    - si profil insuffisant => fallback médiane x sur bande dorsale (au lieu d'abandonner la tranche)
+    Construit la ligne frontale X(Y) à partir d'une SURFACE (grille).
+    - chaque cellule pèse pareil (anti densité)
+    - pour chaque Y, on utilise le profil z(x) et on prend le centre par symétrie
+
+    keep_top_percent_rows: on garde seulement les cellules les plus dorsales dans la ligne Y
+    (utile si la grille contient du bruit "devant" / trous).
     """
-    y = pts_cm[:, 1]
-    y_min, y_max = np.percentile(y, [5, 95])
-    edges = np.linspace(y_min, y_max, n_slices + 1)
+    grid = build_dorsal_surface_grid(pts_cm, cell_cm=cell_cm, z_percentile=z_cell_percentile)
+    if grid is None:
+        return np.empty((0, 3), dtype=float), None
+
+    xc, yc, Z = grid
+    ny, nx = Z.shape
 
     spine = []
-    kept = 0
-    for i in range(n_slices):
-        sl = pts_cm[(y >= edges[i]) & (y < edges[i + 1])]
-        if sl.shape[0] < 15:
+    for j in range(ny):
+        row = Z[j, :]
+        ok = np.isfinite(row)
+        if np.count_nonzero(ok) < max(8, nx // 10):
             continue
 
-        z_thr = np.percentile(sl[:, 2], back_percent)
-        back = sl[sl[:, 2] >= z_thr]
-        if back.shape[0] < 10:
-            back = sl
+        x_row = xc[ok]
+        z_row = row[ok]
 
-        prof = profile_z_of_x(back, nbins=nbins)
-        if prof is None:
-            # fallback (important : ne pas perdre la tranche)
-            x0 = float(np.median(back[:, 0]))
-        else:
-            xc, zc = prof
-            x0 = symmetry_center_from_profile(xc, zc)
+        # option: ne garder que le "dos" dans cette ligne (top z)
+        thr = np.percentile(z_row, 100 - keep_top_percent_rows)
+        sel = z_row >= thr
+        if np.count_nonzero(sel) >= 8:
+            x_row = x_row[sel]
+            z_row = z_row[sel]
 
-        y0 = float(np.median(sl[:, 1]))
-        z0 = float(np.percentile(back[:, 2], 90))
+        # léger lissage du profil (si possible)
+        if len(z_row) >= 11:
+            # ordonner par x
+            order = np.argsort(x_row)
+            x_row = x_row[order]
+            z_row = z_row[order]
+            w = 9 if len(z_row) >= 9 else (len(z_row) // 2) * 2 + 1
+            if w >= 5 and w < len(z_row):
+                z_row = savgol_filter(z_row, w, 2)
+
+        x0 = symmetry_center_1d(x_row, z_row)
+        y0 = float(yc[j])
+
+        # pour z0 (sagittal de la ligne), on peut prendre la moyenne "surface" dorsale de la rangée
+        z0 = float(np.nanpercentile(row, 90))
+
         spine.append([x0, y0, z0])
-        kept += 1
 
     spine = np.array(spine, dtype=float)
     if spine.shape[0] == 0:
-        return spine, kept
+        return spine, grid
     spine = spine[np.argsort(spine[:, 1])]
-    return spine, kept
+    return spine, grid
 
 # ==============================
 # UI
@@ -260,104 +272,77 @@ with st.sidebar:
     do_smooth = st.toggle("Lissage des courbes", True)
     smooth_val = st.slider("Intensité lissage", 5, 51, 25, step=2)
 
-    st.subheader("🧩 Surface-weight (anti densité)")
-    voxel_mm = st.slider("Résolution surface (mm)", 1.0, 8.0, 3.0, 0.5)
+    st.subheader("🧱 Surface (plan frontal)")
+    cell_mm = st.slider("Taille cellule surface (mm)", 2, 10, 4)  # 4mm par défaut
+    z_cell_percentile = st.slider("Surface dos (percentile z/cellule)", 85, 99, 95)
+    keep_top_rows = st.slider("Garder dos (top % par ligne y)", 10, 60, 35)
 
-    st.subheader("🧠 Extraction")
-    auto_vertical = st.toggle("Auto-détection axe vertical", True)
-    n_slices = st.slider("Nombre de tranches", 50, 200, 120)
-    back_percent = st.slider("Bande dorsale (percentile z)", 70, 97, 85)
-    nbins = st.slider("Bins profil z(x)", 20, 140, 70)
-
-    st.subheader("🛠 Debug")
-    show_debug = st.toggle("Afficher debug", True)
-
+    st.divider()
     ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
 
 st.title("🦴 SpineScan Pro")
 
 if ply_file:
     if st.button("⚙️ LANCER L'ANALYSE BIOMÉCANIQUE"):
-        pts_raw = load_ply_numpy(ply_file)
+        # --- LOAD ---
+        pts = load_ply_numpy(ply_file)
 
-        # 1) Echelle -> cm (auto)
-        scale, scale_label = infer_scale_to_cm(pts_raw)
-        pts = pts_raw * scale
+        # IMPORTANT: tu faisais *0.1 (mm->cm).
+        # Ici je garde ton hypothèse "PLY en mm". Si ton PLY est déjà en cm, retire *0.1.
+        pts = pts * 0.1
 
-        # 2) Axe vertical auto
-        if auto_vertical:
-            vax = detect_vertical_axis(pts)
-            pts, order = reorder_axes_to_make_y_vertical(pts, vax)
-
-        # 3) Nettoyage Y
-        y = pts[:, 1]
-        mask = (y > np.percentile(y, 5)) & (y < np.percentile(y, 95))
+        # nettoyage Y (comme avant)
+        mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
         pts = pts[mask]
 
-        # 4) Centrage X robuste
+        # centrage X robuste (utile)
         pts[:, 0] -= np.median(pts[:, 0])
 
-        # 5) Voxel adaptatif si trop agressif
-        voxel_cm = float(voxel_mm) / 10.0
-        pts_u = voxel_downsample_median(pts, voxel_cm)
-
-        # si on a trop détruit le nuage, on réduit automatiquement le voxel
-        # (ça arrive pile dans ton cas)
-        if pts_u.shape[0] < 0.08 * pts.shape[0]:
-            pts_u = voxel_downsample_median(pts, voxel_cm * 0.5)
-            voxel_cm = voxel_cm * 0.5
-
-        # 6) Extraction
-        spine, kept = build_spine_axis_symmetry(
-            pts_cm=pts_u,
-            n_slices=n_slices,
-            back_percent=back_percent,
-            nbins=nbins
+        # --- FRONTAL: surface-weight extraction ---
+        cell_cm = float(cell_mm) / 10.0
+        spine, grid = frontal_centerline_from_surface(
+            pts_cm=pts,
+            cell_cm=cell_cm,
+            z_cell_percentile=z_cell_percentile,
+            keep_top_percent_rows=keep_top_rows
         )
 
-        if show_debug:
-            st.info(
-                f"Échelle détectée: {scale_label} (×{scale:g}) | "
-                f"Points: brut={pts_raw.shape[0]} / nettoyé={pts.shape[0]} / voxel={pts_u.shape[0]} (voxel={voxel_cm*10:.1f} mm) | "
-                f"Tranches gardées: {kept}/{n_slices}"
-            )
-
-        if spine.shape[0] < 10:
+        if spine.shape[0] < 12:
             st.error(
-                "Toujours insuffisant. Dans ce cas, la cause est presque toujours : "
-                "(1) scan incomplet du dos, (2) axes très différents, ou (3) échelle extrême. "
-                "Regarde le debug (points/tranches)."
+                "Extraction insuffisante dans le frontal. "
+                "Essaie: augmenter la taille cellule (mm), ou baisser 'top % par ligne', "
+                "ou vérifier l'échelle (*0.1)."
             )
             st.stop()
 
-        # 7) Lissage
+        # Lissage
         if do_smooth and spine.shape[0] > smooth_val:
             spine = smooth_spine(spine, smooth_val=smooth_val, poly=3)
 
-        # 8) Metrics
+        # --- METRICS (sagittal à partir de z0 de la surface) ---
         fd, fl, vertical_z = compute_sagittal_arrow_lombaire_v2(spine)
         dev_f = float(np.max(np.abs(spine[:, 0])))
 
-        # 9) Plots
+        # --- PLOTS ---
         tmp = tempfile.gettempdir()
         img_f_p, img_s_p = os.path.join(tmp, "f.png"), os.path.join(tmp, "s.png")
 
         fig_f, ax_f = plt.subplots(figsize=(2.2, 4))
-        ax_f.scatter(pts_u[:, 0], pts_u[:, 1], s=0.6, alpha=0.10, color="gray")
+        ax_f.scatter(pts[:, 0], pts[:, 1], s=0.2, alpha=0.08, color="gray")
         ax_f.plot(spine[:, 0], spine[:, 1], "red", linewidth=2.0)
-        ax_f.set_title("Frontale (surface+symétrie)", fontsize=9)
+        ax_f.set_title("Frontale (moyenne surface)", fontsize=9)
         ax_f.axis("off")
         fig_f.savefig(img_f_p, bbox_inches="tight", dpi=160)
 
         fig_s, ax_s = plt.subplots(figsize=(2.2, 4))
-        ax_s.scatter(pts_u[:, 2], pts_u[:, 1], s=0.6, alpha=0.10, color="gray")
+        ax_s.scatter(pts[:, 2], pts[:, 1], s=0.2, alpha=0.08, color="gray")
         ax_s.plot(spine[:, 2], spine[:, 1], "blue", linewidth=2.0)
         ax_s.plot(vertical_z, spine[:, 1], "k--", alpha=0.7, linewidth=1)
         ax_s.set_title("Sagittale", fontsize=9)
         ax_s.axis("off")
         fig_s.savefig(img_s_p, bbox_inches="tight", dpi=160)
 
-        # 10) Display
+        # --- DISPLAY ---
         st.write("### 📈 Analyse Visuelle")
         _, v1, v2, _ = st.columns([1, 1, 1, 1])
         v1.pyplot(fig_f)
@@ -370,14 +355,16 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Méthode robuste : échelle auto → densité uniformisée (voxel) → axe frontal par symétrie du profil z(x) avec fallback (ne bloque pas).
+                Plan frontal: <b>moyenne de surface</b> via grille (x,y) → z_surface (percentile) donc pas d'influence du nombre de points.
+                Axe: centre par <b>symétrie</b> du profil z(x) à chaque hauteur y.
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # 11) PDF
+        # --- PDF ---
         res = {"fd": fd, "fl": fl, "dev_f": dev_f}
         pdf_path = export_pdf_pro({"nom": nom, "prenom": prenom}, res, img_f_p, img_s_p)
+
         st.divider()
         with open(pdf_path, "rb") as f:
             st.download_button("📥 Télécharger le rapport PDF", f, f"Bilan_Spine_{nom}.pdf")
