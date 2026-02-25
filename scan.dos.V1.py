@@ -79,7 +79,7 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
     return path
 
 # ==============================
-# Metrics
+# HELPERS
 # ==============================
 def compute_sagittal_arrow_lombaire_v2(spine_cm):
     y = spine_cm[:, 1]
@@ -92,22 +92,6 @@ def compute_sagittal_arrow_lombaire_v2(spine_cm):
     fd = 0.0
     fl = float(abs(z_lombaire - z_dorsal))
     return fd, fl, vertical_z
-
-# ==============================
-# 1) SURFACE-WEIGHTING (voxel)
-# ==============================
-def voxel_downsample_median(pts_cm, voxel=0.25):
-    if pts_cm.shape[0] == 0:
-        return pts_cm
-    q = np.floor(pts_cm / voxel).astype(np.int64)
-    key = q[:, 0] * 73856093 + q[:, 1] * 19349663 + q[:, 2] * 83492791
-    order = np.argsort(key)
-    pts_sorted = pts_cm[order]
-    key_sorted = key[order]
-    boundaries = np.where(np.diff(key_sorted) != 0)[0] + 1
-    groups = np.split(pts_sorted, boundaries)
-    out = np.array([np.median(g, axis=0) for g in groups], dtype=float)
-    return out
 
 def smooth_spine(spine, smooth_val=25, poly=3):
     if spine.shape[0] < 7:
@@ -127,138 +111,142 @@ def smooth_spine(spine, smooth_val=25, poly=3):
     out[:, 2] = savgol_filter(out[:, 2], w, poly)
     return out
 
-# ==============================
-# 2) EXTRACTION AXE : profil surface z(x) + centre par SYMÉTRIE
-# ==============================
+def detect_vertical_axis(pts):
+    spans = []
+    for a in range(3):
+        q5, q95 = np.percentile(pts[:, a], [5, 95])
+        spans.append(q95 - q5)
+    return int(np.argmax(spans))
+
+def reorder_axes_to_make_y_vertical(pts, vertical_axis):
+    axes = [0, 1, 2]
+    axes.remove(vertical_axis)
+    order = [axes[0], vertical_axis, axes[1]]  # X, Y(vertical), Z
+    return pts[:, order], order
+
+def infer_scale_to_cm(pts):
+    """
+    Heuristique d'échelle :
+    - Si hauteur (amplitude axe vertical) ~ 1.5 à 2.2 => probablement mètres -> *100
+    - Si ~ 150 à 220 => probablement cm -> *1
+    - Si ~ 1500 à 2200 => probablement mm -> *0.1
+    """
+    vax = detect_vertical_axis(pts)
+    q5, q95 = np.percentile(pts[:, vax], [5, 95])
+    height = float(q95 - q5)
+
+    # bornes larges pour ne pas casser
+    if 0.5 < height < 3.0:
+        return 100.0, "m → cm"
+    if 50.0 < height < 300.0:
+        return 1.0, "cm → cm"
+    if 500.0 < height < 3000.0:
+        return 0.1, "mm → cm"
+    # fallback : ne change rien
+    return 1.0, "échelle inconnue (×1)"
+
+def voxel_downsample_median(pts_cm, voxel_cm):
+    if pts_cm.shape[0] == 0:
+        return pts_cm
+    q = np.floor(pts_cm / voxel_cm).astype(np.int64)
+    key = q[:, 0] * 73856093 + q[:, 1] * 19349663 + q[:, 2] * 83492791
+    order = np.argsort(key)
+    pts_sorted = pts_cm[order]
+    key_sorted = key[order]
+    boundaries = np.where(np.diff(key_sorted) != 0)[0] + 1
+    groups = np.split(pts_sorted, boundaries)
+    out = np.array([np.median(g, axis=0) for g in groups], dtype=float)
+    return out
+
 def profile_z_of_x(points, nbins=70):
-    """Construit z(x) robuste : médiane z par bin x. Retourne (xc, zc) ou None."""
-    if points.shape[0] < 30:
+    if points.shape[0] < 20:
         return None
     x = points[:, 0]
     z = points[:, 2]
-
     xmin, xmax = np.percentile(x, [2, 98])
     if xmax - xmin < 1e-6:
-        xc = np.array([np.median(x)], dtype=float)
-        zc = np.array([np.median(z)], dtype=float)
-        return xc, zc
-
+        return np.array([np.median(x)]), np.array([np.median(z)])
     edges = np.linspace(xmin, xmax, nbins + 1)
     xc, zc = [], []
     for i in range(nbins):
         m = (x >= edges[i]) & (x < edges[i + 1])
-        if np.count_nonzero(m) < 6:
+        if np.count_nonzero(m) < 4:
             continue
         xc.append(0.5 * (edges[i] + edges[i + 1]))
         zc.append(float(np.median(z[m])))
-
-    if len(xc) < 10:
+    if len(xc) < 6:
         return None
-
     xc = np.array(xc, dtype=float)
     zc = np.array(zc, dtype=float)
-
-    # léger lissage du profil
-    w = min(9, len(zc) - 1)
+    w = min(7, len(zc) - 1)
     if w % 2 == 0:
         w -= 1
     if w >= 5 and len(zc) > w:
         zc = savgol_filter(zc, w, 2)
-
     return xc, zc
 
-def symmetry_center_from_profile(xc, zc, n_candidates=31, trim=0.08):
-    """
-    Trouve le centre c qui minimise l'asymétrie : sum |z(c+u)-z(c-u)|.
-    trim évite les bords (bras/flancs).
-    """
-    if xc.shape[0] < 12:
+def symmetry_center_from_profile(xc, zc, n_candidates=21, trim=0.10):
+    if xc.shape[0] < 6:
         return float(np.median(xc))
-
-    xmin, xmax = xc.min(), xc.max()
+    xmin, xmax = float(xc.min()), float(xc.max())
     span = xmax - xmin
     a = xmin + trim * span
     b = xmax - trim * span
     if b <= a:
         return float(np.median(xc))
-
     candidates = np.linspace(a, b, n_candidates)
-
-    best_c = None
-    best_cost = np.inf
-
-    # Préparer une interpolation linéaire simple via np.interp
+    best_c, best_cost = None, np.inf
     for c in candidates:
-        # choisir des u qui restent dans [a,b]
         umax = min(c - xmin, xmax - c)
         if umax <= 0:
             continue
-        us = np.linspace(0, umax, 25)
-
-        xL = c - us
-        xR = c + us
-
-        zL = np.interp(xL, xc, zc)
-        zR = np.interp(xR, xc, zc)
-
+        us = np.linspace(0, umax, 21)
+        zL = np.interp(c - us, xc, zc)
+        zR = np.interp(c + us, xc, zc)
         cost = float(np.mean(np.abs(zR - zL)))
         if cost < best_cost:
-            best_cost = cost
-            best_c = c
+            best_cost, best_c = cost, c
+    return float(best_c if best_c is not None else np.median(xc))
 
-    if best_c is None:
-        best_c = float(np.median(xc))
-    return float(best_c)
-
-def build_spine_axis_symmetry(pts_cm, n_slices=90, back_percent=85, nbins=70, k_std=1.5):
+def build_spine_axis_symmetry(pts_cm, n_slices=90, back_percent=85, nbins=70):
     """
-    Par tranche Y:
-      - filtre outliers (comme ton code)
-      - garde bande dorsale (z haut)
-      - construit profil z(x)
-      - centre par symétrie (frontal propre)
-      - z0 pris sur la bande dorsale (sagittal stable)
+    Version qui NE BLOQUE PAS :
+    - si profil insuffisant => fallback médiane x sur bande dorsale (au lieu d'abandonner la tranche)
     """
     y = pts_cm[:, 1]
-    edges = np.linspace(np.percentile(y, 5), np.percentile(y, 95), n_slices + 1)
+    y_min, y_max = np.percentile(y, [5, 95])
+    edges = np.linspace(y_min, y_max, n_slices + 1)
 
     spine = []
+    kept = 0
     for i in range(n_slices):
         sl = pts_cm[(y >= edges[i]) & (y < edges[i + 1])]
-        if sl.shape[0] < 40:
+        if sl.shape[0] < 15:
             continue
 
-        # filtre existant (garde ce qui fonctionne)
-        mx, sx = sl[:, 0].mean(), sl[:, 0].std()
-        if sx > 1e-9:
-            sl = sl[(sl[:, 0] > mx - k_std * sx) & (sl[:, 0] < mx + k_std * sx)]
-        if sl.shape[0] < 30:
-            continue
-
-        # bande dorsale (dos)
         z_thr = np.percentile(sl[:, 2], back_percent)
         back = sl[sl[:, 2] >= z_thr]
-        if back.shape[0] < 20:
-            back = sl  # fallback
+        if back.shape[0] < 10:
+            back = sl
 
         prof = profile_z_of_x(back, nbins=nbins)
         if prof is None:
-            continue
-        xc, zc = prof
-
-        # centre par symétrie (corrige biais omoplates / trous / densité)
-        x0 = symmetry_center_from_profile(xc, zc, n_candidates=31, trim=0.10)
+            # fallback (important : ne pas perdre la tranche)
+            x0 = float(np.median(back[:, 0]))
+        else:
+            xc, zc = prof
+            x0 = symmetry_center_from_profile(xc, zc)
 
         y0 = float(np.median(sl[:, 1]))
-        z0 = float(np.percentile(back[:, 2], 90))  # sagittal stable (dos)
-
+        z0 = float(np.percentile(back[:, 2], 90))
         spine.append([x0, y0, z0])
+        kept += 1
 
     spine = np.array(spine, dtype=float)
     if spine.shape[0] == 0:
-        return spine
+        return spine, kept
     spine = spine[np.argsort(spine[:, 1])]
-    return spine
+    return spine, kept
 
 # ==============================
 # UI
@@ -271,15 +259,18 @@ with st.sidebar:
 
     do_smooth = st.toggle("Lissage des courbes", True)
     smooth_val = st.slider("Intensité lissage", 5, 51, 25, step=2)
-    k_std = st.slider("Filtre points", 0.5, 3.0, 1.2)
 
-    st.subheader("🧩 Moyenne de surface")
-    voxel_mm = st.slider("Résolution surface (mm)", 1.5, 8.0, 3.0, 0.5)
+    st.subheader("🧩 Surface-weight (anti densité)")
+    voxel_mm = st.slider("Résolution surface (mm)", 1.0, 8.0, 3.0, 0.5)
 
-    st.subheader("🧠 Axe frontal par symétrie")
-    n_slices = st.slider("Nombre de tranches", 50, 160, 95)
-    back_percent = st.slider("Bande dorsale (percentile z)", 70, 95, 85)
-    nbins = st.slider("Bins profil z(x)", 30, 120, 70)
+    st.subheader("🧠 Extraction")
+    auto_vertical = st.toggle("Auto-détection axe vertical", True)
+    n_slices = st.slider("Nombre de tranches", 50, 200, 120)
+    back_percent = st.slider("Bande dorsale (percentile z)", 70, 97, 85)
+    nbins = st.slider("Bins profil z(x)", 20, 140, 70)
+
+    st.subheader("🛠 Debug")
+    show_debug = st.toggle("Afficher debug", True)
 
     ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
 
@@ -287,48 +278,74 @@ st.title("🦴 SpineScan Pro")
 
 if ply_file:
     if st.button("⚙️ LANCER L'ANALYSE BIOMÉCANIQUE"):
-        # --- LOAD (mm -> cm) ---
-        pts = load_ply_numpy(ply_file) * 0.1
+        pts_raw = load_ply_numpy(ply_file)
 
-        # --- nettoyage y (comme avant) ---
-        mask = (pts[:, 1] > np.percentile(pts[:, 1], 5)) & (pts[:, 1] < np.percentile(pts[:, 1], 95))
+        # 1) Echelle -> cm (auto)
+        scale, scale_label = infer_scale_to_cm(pts_raw)
+        pts = pts_raw * scale
+
+        # 2) Axe vertical auto
+        if auto_vertical:
+            vax = detect_vertical_axis(pts)
+            pts, order = reorder_axes_to_make_y_vertical(pts, vax)
+
+        # 3) Nettoyage Y
+        y = pts[:, 1]
+        mask = (y > np.percentile(y, 5)) & (y < np.percentile(y, 95))
         pts = pts[mask]
 
-        # --- centrage X robuste ---
+        # 4) Centrage X robuste
         pts[:, 0] -= np.median(pts[:, 0])
 
-        # ✅ surface-weight : supprime influence densité
+        # 5) Voxel adaptatif si trop agressif
         voxel_cm = float(voxel_mm) / 10.0
-        pts_u = voxel_downsample_median(pts, voxel=voxel_cm)
+        pts_u = voxel_downsample_median(pts, voxel_cm)
 
-        # ✅ axe frontal stable : symétrie de surface
-        spine = build_spine_axis_symmetry(
+        # si on a trop détruit le nuage, on réduit automatiquement le voxel
+        # (ça arrive pile dans ton cas)
+        if pts_u.shape[0] < 0.08 * pts.shape[0]:
+            pts_u = voxel_downsample_median(pts, voxel_cm * 0.5)
+            voxel_cm = voxel_cm * 0.5
+
+        # 6) Extraction
+        spine, kept = build_spine_axis_symmetry(
             pts_cm=pts_u,
             n_slices=n_slices,
             back_percent=back_percent,
-            nbins=nbins,
-            k_std=k_std
+            nbins=nbins
         )
 
+        if show_debug:
+            st.info(
+                f"Échelle détectée: {scale_label} (×{scale:g}) | "
+                f"Points: brut={pts_raw.shape[0]} / nettoyé={pts.shape[0]} / voxel={pts_u.shape[0]} (voxel={voxel_cm*10:.1f} mm) | "
+                f"Tranches gardées: {kept}/{n_slices}"
+            )
+
         if spine.shape[0] < 10:
-            st.error("Extraction insuffisante. Essaie : augmenter les tranches, augmenter la bande dorsale, ou réduire les mm (voxel).")
+            st.error(
+                "Toujours insuffisant. Dans ce cas, la cause est presque toujours : "
+                "(1) scan incomplet du dos, (2) axes très différents, ou (3) échelle extrême. "
+                "Regarde le debug (points/tranches)."
+            )
             st.stop()
 
+        # 7) Lissage
         if do_smooth and spine.shape[0] > smooth_val:
             spine = smooth_spine(spine, smooth_val=smooth_val, poly=3)
 
-        # --- metrics ---
+        # 8) Metrics
         fd, fl, vertical_z = compute_sagittal_arrow_lombaire_v2(spine)
         dev_f = float(np.max(np.abs(spine[:, 0])))
 
-        # --- plots ---
+        # 9) Plots
         tmp = tempfile.gettempdir()
         img_f_p, img_s_p = os.path.join(tmp, "f.png"), os.path.join(tmp, "s.png")
 
         fig_f, ax_f = plt.subplots(figsize=(2.2, 4))
         ax_f.scatter(pts_u[:, 0], pts_u[:, 1], s=0.6, alpha=0.10, color="gray")
         ax_f.plot(spine[:, 0], spine[:, 1], "red", linewidth=2.0)
-        ax_f.set_title("Frontale (symétrie surface)", fontsize=9)
+        ax_f.set_title("Frontale (surface+symétrie)", fontsize=9)
         ax_f.axis("off")
         fig_f.savefig(img_f_p, bbox_inches="tight", dpi=160)
 
@@ -340,7 +357,7 @@ if ply_file:
         ax_s.axis("off")
         fig_s.savefig(img_s_p, bbox_inches="tight", dpi=160)
 
-        # --- display ---
+        # 10) Display
         st.write("### 📈 Analyse Visuelle")
         _, v1, v2, _ = st.columns([1, 1, 1, 1])
         v1.pyplot(fig_f)
@@ -353,16 +370,14 @@ if ply_file:
             <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
             <div class="disclaimer">
-                Méthode: <b>moyenne de surface</b> (voxelisation) + axe frontal par <b>symétrie du profil z(x)</b>.
-                Cette symétrie supprime le biais “omoplate / trou / densité” que tu observes.
+                Méthode robuste : échelle auto → densité uniformisée (voxel) → axe frontal par symétrie du profil z(x) avec fallback (ne bloque pas).
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # --- export PDF ---
+        # 11) PDF
         res = {"fd": fd, "fl": fl, "dev_f": dev_f}
         pdf_path = export_pdf_pro({"nom": nom, "prenom": prenom}, res, img_f_p, img_s_p)
-
         st.divider()
         with open(pdf_path, "rb") as f:
             st.download_button("📥 Télécharger le rapport PDF", f, f"Bilan_Spine_{nom}.pdf")
