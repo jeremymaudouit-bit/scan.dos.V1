@@ -58,8 +58,8 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
         ["Flèche Dorsale", f"{results['fd']:.2f} cm"],
         ["Flèche Lombaire", f"{results['fl']:.2f} cm ({results['fl_status']})"],
         ["Déviation Latérale Max", f"{results['dev_f']:.2f} cm"],
-        ["Angle Lordose Lombaire (est.)", f"{results['lordosis_deg']:.1f}°"],
-        ["Angle Cyphose Dorsale (est.)", f"{results['kyphosis_deg']:.1f}°"],
+        ["Angle Lordose Lombaire (est.)", f"{results['lordosis_deg']:.1f}° ({results['lordosis_status']})"],
+        ["Angle Cyphose Dorsale (est.)", f"{results['kyphosis_deg']:.1f}° ({results['kyphosis_status']})"],
         ["Jonction Thoraco-Lombaire (est.)", f"{results['y_junction']:.1f} cm" if results['y_junction'] is not None else "n/a"],
         ["Couverture / Fiabilité", f"{results['coverage_pct']:.0f}% / {results['reliability_pct']:.0f}%"],
     ]
@@ -85,10 +85,6 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
 # METRICS
 # ==============================
 def compute_sagittal_arrow_lombaire_v2(spine_cm):
-    """
-    Version simple cohérente avec ton code initial:
-    fl = |z_min - z_max|
-    """
     y = spine_cm[:, 1]
     z = spine_cm[:, 2]
     if len(z) == 0:
@@ -106,6 +102,13 @@ def classify_fl(fl_cm, lo=2.5, hi=4.5):
     if fl_cm < lo:
         return "Trop faible"
     if fl_cm > hi:
+        return "Trop élevée"
+    return "Normale"
+
+def classify_angle(val_deg, lo, hi):
+    if val_deg < lo:
+        return "Trop faible"
+    if val_deg > hi:
         return "Trop élevée"
     return "Normale"
 
@@ -336,14 +339,6 @@ def extract_midline_full_with_quality(
 # ANGLES V2 (concavité/convexité + tangentes)
 # ==============================
 def estimate_lordosis_kyphosis_angles_v2(spine, smooth_win=21):
-    """
-    Estime angles lordose/cyphose dans le plan sagittal à partir de z(y).
-    - Lordose = concavité basse
-    - Cyphose = convexité haute
-    Mesure = différence d'angles entre tangentes (en degrés).
-
-    Retour: (lordosis_deg, kyphosis_deg, y_junction)
-    """
     if spine.shape[0] < 25:
         return 0.0, 0.0, None
 
@@ -355,7 +350,6 @@ def estimate_lordosis_kyphosis_angles_v2(spine, smooth_win=21):
     w = int(smooth_win)
     if w % 2 == 0:
         w += 1
-    # clamp to valid odd window < n
     if w >= n:
         w = n - 1 if (n - 1) % 2 == 1 else n - 2
     w = max(7, w)
@@ -375,13 +369,11 @@ def estimate_lordosis_kyphosis_angles_v2(spine, smooth_win=21):
     sign_low = np.sign(np.median(low))
     sign_high = np.sign(np.median(high))
 
-    # On veut bas ~ concave (positif) et haut ~ convexe (négatif).
-    # Si c'est inversé, on inverse le signe (équivalent à inverser z).
+    # On veut bas concave (+) et haut convexe (-). Si inversé, on inverse.
     if (sign_low < 0 and sign_high > 0):
         d2z = -d2z
         dz = -dz
 
-    # jonction = zone centrale où |d2z| minimal (proche inflexion)
     y_mid_lo = np.percentile(y, 35)
     y_mid_hi = np.percentile(y, 65)
     mid_mask = (y >= y_mid_lo) & (y <= y_mid_hi)
@@ -404,7 +396,6 @@ def estimate_lordosis_kyphosis_angles_v2(spine, smooth_win=21):
     lordosis = float(abs(theta[i_j] - theta[i_bot]))
     kyphosis = float(abs(theta[i_top] - theta[i_j]))
 
-    # fallback si jonction trop proche des bords
     if (y_j - y_bot) < 0.15 * (y_top - y_bot) or (y_top - y_j) < 0.15 * (y_top - y_bot):
         y_j_fb = float(np.percentile(y, 50))
         i_j_fb = int(np.argmin(np.abs(y - y_j_fb)))
@@ -415,7 +406,7 @@ def estimate_lordosis_kyphosis_angles_v2(spine, smooth_win=21):
     return lordosis, kyphosis, y_j
 
 # ==============================
-# COLORED CURVE PLOT
+# COLORED CURVE
 # ==============================
 def plot_colored_curve(ax, x, y, q, lw=2.6):
     if len(x) < 2:
@@ -458,8 +449,16 @@ with st.sidebar:
     median_k = st.slider("Anti-pics (médian)", 3, 31, 11, step=2)
 
     st.divider()
-    st.subheader("📐 Angles (plan sagittal)")
+    st.subheader("📐 Angles (plan sagittal) + normes")
     angle_smooth = st.slider("Lissage angles (fenêtre)", 7, 41, 21, step=2)
+
+    show_norms = st.toggle("Afficher normes", True)
+
+    st.caption("Normes (par défaut)")
+    lord_lo, lord_hi = 40.0, 60.0
+    kyph_lo, kyph_hi = 27.0, 47.0
+    st.write(f"- Lordose: {lord_lo:.0f}° à {lord_hi:.0f}°")
+    st.write(f"- Cyphose: {kyph_lo:.0f}° à {kyph_hi:.0f}°")
 
     st.divider()
     ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
@@ -470,12 +469,10 @@ if ply_file:
     if st.button("⚙️ LANCER L'ANALYSE BIOMÉCANIQUE"):
         pts = load_ply_numpy(ply_file) * 0.1  # mm -> cm
 
-        # nettoyage Y moins agressif pour garder tout le dos
         mask = (pts[:, 1] > np.percentile(pts[:, 1], 1)) & (pts[:, 1] < np.percentile(pts[:, 1], 99))
         pts = pts[mask]
 
-        # centrage global X (affichage uniquement)
-        pts[:, 0] -= np.median(pts[:, 0])
+        pts[:, 0] -= np.median(pts[:, 0])  # centrage affichage
 
         spine, q = extract_midline_full_with_quality(
             pts,
@@ -492,25 +489,23 @@ if ply_file:
             st.error("Impossible d'extraire une courbe (scan trop incomplet).")
             st.stop()
 
-        # lissage final
         if do_smooth:
             spine = smooth_spine(spine, window=smooth_window, strong=strong_smooth, median_k=median_k)
 
-        # métriques
         fd, fl, vertical_z = compute_sagittal_arrow_lombaire_v2(spine)
         fl_status = classify_fl(fl, 2.5, 4.5)
         dev_f = float(np.max(np.abs(spine[:, 0]))) if spine.size else 0.0
 
-        # angles V2 (concavité/convexité)
         lordosis_deg, kyphosis_deg, y_junction = estimate_lordosis_kyphosis_angles_v2(spine, smooth_win=int(angle_smooth))
 
-        # couverture / fiabilité
+        lordosis_status = classify_angle(lordosis_deg, lord_lo, lord_hi)
+        kyphosis_status = classify_angle(kyphosis_deg, kyph_lo, kyph_hi)
+
         y_span_pts = float(np.percentile(pts[:, 1], 98) - np.percentile(pts[:, 1], 2))
         y_span_sp = float(np.max(spine[:, 1]) - np.min(spine[:, 1])) if spine.shape[0] else 0.0
         coverage_pct = 100.0 * (y_span_sp / y_span_pts) if y_span_pts > 1e-6 else 0.0
         reliability_pct = 100.0 * float(np.mean(q >= 0.6)) if q.size else 0.0
 
-        # ---------- FIGURES ----------
         tmp = tempfile.gettempdir()
         img_f_p, img_s_p = os.path.join(tmp, "f.png"), os.path.join(tmp, "s.png")
 
@@ -545,25 +540,30 @@ if ply_file:
         ax_leg.imshow(gradient, aspect="auto", cmap="RdYlGn")
         st.pyplot(fig_leg)
 
-        # ---------- Synthèse ----------
-        badge = '<span class="badge-ok">Normale</span>' if fl_status == "Normale" else '<span class="badge-no">Hors norme</span>'
+        badge_fl = '<span class="badge-ok">Normale</span>' if fl_status == "Normale" else '<span class="badge-no">Hors norme</span>'
+        badge_lord = '<span class="badge-ok">Normale</span>' if lordosis_status == "Normale" else '<span class="badge-no">Hors norme</span>'
+        badge_kyph = '<span class="badge-ok">Normale</span>' if kyphosis_status == "Normale" else '<span class="badge-no">Hors norme</span>'
 
         st.write("### 📋 Synthèse des résultats")
         st.markdown(f"""
         <div class="result-box">
             <p><b>📏 Flèche Dorsale :</b> <span class="value-text">{fd:.2f} cm</span></p>
-            <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span> &nbsp; {badge}
+            <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span> &nbsp; {badge_fl}
                <br><span style="color:#666;font-size:0.9rem;">Référence: 2.5 à 4.5 cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
-            <p><b>📐 Angle lordose lombaire (est.) :</b> <span class="value-text">{lordosis_deg:.1f}°</span></p>
-            <p><b>📐 Angle cyphose dorsale (est.) :</b> <span class="value-text">{kyphosis_deg:.1f}°</span></p>
+            <p><b>📐 Angle lordose lombaire (est.) :</b> <span class="value-text">{lordosis_deg:.1f}°</span>
+               {"&nbsp; " + badge_lord if show_norms else ""}
+               {"<br><span style='color:#666;font-size:0.9rem;'>Référence: 40° à 60°</span>" if show_norms else ""}</p>
+            <p><b>📐 Angle cyphose dorsale (est.) :</b> <span class="value-text">{kyphosis_deg:.1f}°</span>
+               {"&nbsp; " + badge_kyph if show_norms else ""}
+               {"<br><span style='color:#666;font-size:0.9rem;'>Référence: 27° à 47°</span>" if show_norms else ""}</p>
             <p><b>🔁 Jonction thoraco-lombaire (est.) :</b> <span class="value-text">{(f"{y_junction:.1f} cm" if y_junction is not None else "n/a")}</span></p>
             <p><b>✅ Couverture hauteur :</b> <span class="value-text">{coverage_pct:.0f}%</span>
                &nbsp; <b>Fiabilité :</b> <span class="value-text">{reliability_pct:.0f}%</span>
                <br><span style="color:#666;font-size:0.9rem;">Fiabilité = % des points avec score ≥ 0.60</span></p>
             <div class="disclaimer">
                 Midline “tout le dos” = milieu entre bords (bins X, anti-biais densité) + couleur selon score qualité.
-                Angles V2 = calcul dans le plan sagittal via concavité/convexité (z''(y)) + différence de tangentes.
+                Angles V2 = plan sagittal via concavité/convexité (z''(y)) + différence de tangentes.
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -575,6 +575,8 @@ if ply_file:
             "dev_f": float(dev_f),
             "lordosis_deg": float(lordosis_deg),
             "kyphosis_deg": float(kyphosis_deg),
+            "lordosis_status": lordosis_status,
+            "kyphosis_status": kyphosis_status,
             "y_junction": None if y_junction is None else float(y_junction),
             "coverage_pct": float(coverage_pct),
             "reliability_pct": float(reliability_pct),
