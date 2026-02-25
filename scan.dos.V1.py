@@ -1,6 +1,8 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib import colors as mcolors
 from scipy.signal import savgol_filter
 import tempfile, os
 from plyfile import PlyData
@@ -16,13 +18,15 @@ from reportlab.lib.pagesizes import A4
 st.set_page_config(page_title="SpineScan Pro 3D", layout="wide")
 
 st.markdown("""
-    <style>
-    .main { background-color: #f8f9fc; }
-    .result-box { background-color:#fff; padding:14px; border-radius:10px; border:1px solid #e0e0e0; margin-bottom:10px; }
-    .value-text { font-size: 1.1rem; font-weight: bold; color: #2c3e50; }
-    .stButton>button { background-color: #2c3e50; color: white; width: 100%; border-radius: 8px; font-weight: bold; }
-    .disclaimer { font-size: 0.82rem; color: #555; font-style: italic; margin-top: 10px; border-left: 3px solid #ccc; padding-left: 10px;}
-    </style>
+<style>
+.main { background-color: #f8f9fc; }
+.result-box { background-color:#fff; padding:14px; border-radius:10px; border:1px solid #e0e0e0; margin-bottom:10px; }
+.value-text { font-size: 1.1rem; font-weight: bold; color: #2c3e50; }
+.stButton>button { background-color: #2c3e50; color: white; width: 100%; border-radius: 8px; font-weight: bold; }
+.disclaimer { font-size: 0.82rem; color: #555; font-style: italic; margin-top: 10px; border-left: 3px solid #ccc; padding-left: 10px;}
+.badge-ok {display:inline-block; padding:2px 8px; border-radius:999px; background:#e8f7ee; color:#156f3b; font-weight:700; font-size:0.85rem;}
+.badge-no {display:inline-block; padding:2px 8px; border-radius:999px; background:#fdecec; color:#9b1c1c; font-weight:700; font-size:0.85rem;}
+</style>
 """, unsafe_allow_html=True)
 
 # ==============================
@@ -49,11 +53,18 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
     story.append(Paragraph(f"<b>Patient :</b> {patient_info['prenom']} {patient_info['nom']}", styles["Normal"]))
     story.append(Spacer(1, 0.4 * cm))
 
+    def ok_badge(text, ok=True):
+        col = "#156f3b" if ok else "#9b1c1c"
+        return f'<font color="{col}"><b>{text}</b></font>'
+
     data = [
         ["Indicateur", "Valeur Mesurée"],
         ["Flèche Dorsale", f"{results['fd']:.2f} cm"],
-        ["Flèche Lombaire", f"{results['fl']:.2f} cm"],
+        ["Flèche Lombaire", f"{results['fl']:.2f} cm  ({results['fl_status']})"],
         ["Déviation Latérale Max", f"{results['dev_f']:.2f} cm"],
+        ["Angle Lordose Lombaire (est.)", f"{results['lordosis_deg']:.1f}°"],
+        ["Angle Cyphose Dorsale (est.)", f"{results['kyphosis_deg']:.1f}°"],
+        ["Couverture / Fiabilité", f"{results['coverage_pct']:.0f}% / {results['reliability_pct']:.0f}%"],
     ]
 
     t = Table(data, colWidths=[7 * cm, 7 * cm])
@@ -74,9 +85,12 @@ def export_pdf_pro(patient_info, results, img_f, img_s):
     return path
 
 # ==============================
-# METRICS (sagittal)
+# METRICS
 # ==============================
 def compute_sagittal_arrow_lombaire_v2(spine_cm):
+    """
+    Simplifié: fl = |z_min - z_max|. (Comme ton code)
+    """
     y = spine_cm[:, 1]
     z = spine_cm[:, 2]
     if len(z) == 0:
@@ -89,6 +103,13 @@ def compute_sagittal_arrow_lombaire_v2(spine_cm):
     fd = 0.0
     fl = float(abs(z_lombaire - z_dorsal))
     return fd, fl, vertical_z
+
+def classify_fl(fl_cm, lo=2.5, hi=4.5):
+    if fl_cm < lo:
+        return "Trop faible"
+    if fl_cm > hi:
+        return "Trop élevée"
+    return "Normale"
 
 # ==============================
 # LISSAGE
@@ -159,16 +180,16 @@ def apply_rotation_xz(pts, R):
     return np.column_stack([XZ_rot[:, 0], pts[:, 1], XZ_rot[:, 1]])
 
 # ==============================
-# MIDLINE FULL BACK (density-free + fill gaps)
+# MIDLINE + QUALITY (density-free)
 # ==============================
-def slice_profile_surface_binned(sl, cell_cm=0.5, z_percentile=93, min_pts_per_bin=2):
+def slice_profile_surface_binned(sl, cell_cm=0.6, z_percentile=92, min_pts_per_bin=2):
     x = sl[:, 0]
     z = sl[:, 2]
     xmin, xmax = np.percentile(x, [2, 98])
     if xmax - xmin < 1e-6:
-        return None, None
+        return None, None, 0.0
 
-    nbins = max(28, int(np.ceil((xmax - xmin) / cell_cm)))
+    nbins = max(26, int(np.ceil((xmax - xmin) / cell_cm)))
     edges = np.linspace(xmin, xmax, nbins + 1)
 
     xc, zc = [], []
@@ -180,12 +201,15 @@ def slice_profile_surface_binned(sl, cell_cm=0.5, z_percentile=93, min_pts_per_b
         zc.append(float(np.percentile(z[m], z_percentile)))
 
     if len(xc) < 10:
-        return None, None
+        return None, None, 0.0
 
     xc = np.array(xc, dtype=float)
     zc = np.array(zc, dtype=float)
     o = np.argsort(xc)
-    return xc[o], zc[o]
+    xc, zc = xc[o], zc[o]
+
+    width = float(np.percentile(xc, 95) - np.percentile(xc, 5))
+    return xc, zc, width
 
 def midline_from_profile(xc, zc, q_edge=8):
     xl = float(np.percentile(xc, q_edge))
@@ -194,15 +218,47 @@ def midline_from_profile(xc, zc, q_edge=8):
     z_mid = float(np.interp(x_mid, xc, zc))
     return x_mid, z_mid
 
-def extract_spine_midline_full(
+def quality_score(n_points_slice, n_bins, width_cm, jump_cm, expected_width=(10.0, 45.0)):
+    """
+    Retourne un score 0..1 basé sur:
+    - nb points dans la slice (mais sans influencer le centre)
+    - nb bins valides
+    - largeur plausible
+    - continuité (jump)
+    """
+    # points (capé)
+    s_pts = np.clip((n_points_slice - 30) / 200.0, 0.0, 1.0)
+    # bins
+    s_bins = np.clip((n_bins - 10) / 25.0, 0.0, 1.0)
+    # width
+    w_lo, w_hi = expected_width
+    if width_cm <= 0:
+        s_w = 0.0
+    elif width_cm < w_lo:
+        s_w = np.clip(width_cm / w_lo, 0.0, 1.0)
+    elif width_cm > w_hi:
+        s_w = np.clip(w_hi / width_cm, 0.0, 1.0)
+    else:
+        s_w = 1.0
+    # jump
+    if jump_cm is None:
+        s_j = 1.0
+    else:
+        s_j = np.clip(1.0 - (abs(jump_cm) / 4.0), 0.0, 1.0)  # >4cm => mauvais
+
+    # pondération
+    score = 0.25 * s_pts + 0.35 * s_bins + 0.25 * s_w + 0.15 * s_j
+    return float(np.clip(score, 0.0, 1.0))
+
+def extract_midline_full_with_quality(
     pts,
     remove_lateral_outliers=True,
-    cell_cm=0.55,
-    z_percentile=93,
+    cell_cm=0.70,
+    z_percentile=92,
     q_edge=8,
     y_low=2,
     y_high=98,
-    allow_fill_gaps=True,
+    allow_fill_gaps=True
 ):
     R = estimate_rotation_xz(pts)
     pr = apply_rotation_xz(pts, R)
@@ -211,11 +267,11 @@ def extract_spine_midline_full(
     y0 = np.percentile(y, y_low)
     y1 = np.percentile(y, y_high)
 
-    # Plus de tranches pour couvrir tout le dos
-    n_slices = int(np.clip((pr.shape[0] // 2500) + 220, 200, 320))
+    n_slices = int(np.clip((pr.shape[0] // 2500) + 240, 220, 360))
     edges_y = np.linspace(y0, y1, n_slices)
 
-    spine = []
+    spine = []        # x,y,z
+    qlist = []        # quality 0..1
     prev_x = None
     prev_z = None
 
@@ -223,9 +279,11 @@ def extract_spine_midline_full(
         sl = pr[(y >= edges_y[i]) & (y < edges_y[i + 1])]
         y_mid = float(0.5 * (edges_y[i] + edges_y[i + 1]))
 
+        # très peu de points
         if sl.shape[0] < 25:
             if allow_fill_gaps and prev_x is not None and prev_z is not None:
                 spine.append([prev_x, y_mid, prev_z])
+                qlist.append(0.15)  # rempli => faible
             continue
 
         if remove_lateral_outliers:
@@ -235,21 +293,22 @@ def extract_spine_midline_full(
             if sl.shape[0] < 20:
                 if allow_fill_gaps and prev_x is not None and prev_z is not None:
                     spine.append([prev_x, y_mid, prev_z])
+                    qlist.append(0.15)
                 continue
 
-        # tentative 1 (cell_cm courant)
-        xc, zc = slice_profile_surface_binned(sl, cell_cm=cell_cm, z_percentile=z_percentile, min_pts_per_bin=2)
-
-        # tentative 2: bins plus larges si le haut est pauvre
+        # essai 1
+        xc, zc, width = slice_profile_surface_binned(sl, cell_cm=cell_cm, z_percentile=z_percentile, min_pts_per_bin=2)
+        # essai 2 (bins plus larges)
         if xc is None:
-            xc, zc = slice_profile_surface_binned(sl, cell_cm=min(0.9, cell_cm * 1.5), z_percentile=z_percentile, min_pts_per_bin=2)
+            xc, zc, width = slice_profile_surface_binned(sl, cell_cm=min(1.10, cell_cm * 1.5), z_percentile=z_percentile, min_pts_per_bin=2)
 
         if xc is None:
             if allow_fill_gaps and prev_x is not None and prev_z is not None:
                 spine.append([prev_x, y_mid, prev_z])
+                qlist.append(0.15)
             continue
 
-        # lissage léger du profil
+        # lissage profil (bins)
         if len(zc) >= 9:
             zc_s = savgol_filter(zc, 9, 2)
         else:
@@ -257,25 +316,106 @@ def extract_spine_midline_full(
 
         x0, z0 = midline_from_profile(xc, zc_s, q_edge=q_edge)
 
-        # continuité douce (évite sauts énormes)
-        if prev_x is not None and abs(x0 - prev_x) > 3.0:
+        # continuité (évite sauts)
+        jump = None if prev_x is None else (x0 - prev_x)
+        if prev_x is not None and abs(jump) > 3.0:
             x0 = prev_x
             z0 = float(np.interp(x0, xc, zc_s))
+            jump = 0.0
+
+        score = quality_score(
+            n_points_slice=int(sl.shape[0]),
+            n_bins=int(len(xc)),
+            width_cm=float(width),
+            jump_cm=jump
+        )
 
         prev_x, prev_z = x0, z0
         spine.append([x0, float(np.median(sl[:, 1])), float(z0)])
+        qlist.append(score)
 
     if len(spine) == 0:
-        return np.empty((0, 3), dtype=float)
+        return np.empty((0, 3), dtype=float), np.array([], dtype=float)
 
     spine = np.array(spine, dtype=float)
-    spine = spine[np.argsort(spine[:, 1])]
+    qlist = np.array(qlist, dtype=float)
+
+    o = np.argsort(spine[:, 1])
+    spine = spine[o]
+    qlist = qlist[o]
 
     # retour repère original
     XZ_back = spine[:, [0, 2]] @ R
     spine[:, 0] = XZ_back[:, 0]
     spine[:, 2] = XZ_back[:, 1]
-    return spine
+    return spine, qlist
+
+# ==============================
+# ANGLES (estimations)
+# ==============================
+def _segment_angle_deg(dz, dy):
+    # angle par rapport à la verticale (dy)
+    # on prend la valeur absolue de l'angle
+    ang = np.degrees(np.arctan2(dz, dy))
+    return float(ang)
+
+def estimate_lordosis_kyphosis_angles(spine):
+    """
+    Estimation sur le profil sagittal z(y).
+    On découpe par percentiles en Y (répétable pour suivi).
+    """
+    if spine.shape[0] < 20:
+        return 0.0, 0.0
+
+    y = spine[:, 1]
+    z = spine[:, 2]
+
+    # lissage léger pour la pente
+    z_s = savgol_filter(z, 11 if len(z) >= 11 else (len(z)//2*2+1), 2) if len(z) >= 7 else z
+
+    # régions (en % de hauteur)
+    y10, y30, y55, y80, y95 = np.percentile(y, [10, 30, 55, 80, 95])
+
+    # Lombaire approx : 10-30% (bas du dos)
+    mL = (y >= y10) & (y <= y30)
+    # Dorsale approx : 55-80% (milieu/haut)
+    mT = (y >= y55) & (y <= y80)
+
+    def region_angle(mask):
+        yy = y[mask]
+        zz = z_s[mask]
+        if yy.size < 6:
+            return 0.0
+        # fit linéaire z = a*y + b => pente a
+        a = np.polyfit(yy, zz, 1)[0]
+        # angle "inclinaison" (dz/dy)
+        return abs(np.degrees(np.arctan(a)))
+
+    lordosis = region_angle(mL)
+    kyphosis = region_angle(mT)
+    return float(lordosis), float(kyphosis)
+
+# ==============================
+# PLOTTING (colored curve)
+# ==============================
+def plot_colored_curve(ax, x, y, q, lw=2.6):
+    """
+    q in [0,1], 0=rouge, 1=vert (colormap RdYlGn)
+    """
+    if len(x) < 2:
+        return
+    pts = np.column_stack([x, y]).reshape(-1, 1, 2)
+    segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
+
+    q_seg = 0.5 * (q[:-1] + q[1:])
+    cmap = plt.get_cmap("RdYlGn")
+    norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+
+    lc = LineCollection(segs, cmap=cmap, norm=norm)
+    lc.set_array(q_seg)
+    lc.set_linewidth(lw)
+    ax.add_collection(lc)
+    ax.autoscale_view()
 
 # ==============================
 # UI
@@ -286,16 +426,16 @@ with st.sidebar:
     prenom = st.text_input("Prénom", "Jean")
     st.divider()
 
-    st.subheader("🧭 Ligne médiane dos (tout le dos)")
+    st.subheader("🧭 Midline (tout le dos) + fiabilité")
     remove_lat = st.toggle("Limiter artefacts latéraux (bras)", True)
-    allow_fill = st.toggle("Remplir les manques (continuité)", True)
+    allow_fill = st.toggle("Remplir les manques (faible fiabilité)", True)
 
-    cell_cm = st.slider("Taille bin X (cm)", 0.30, 1.20, 0.55, step=0.05)
-    z_perc = st.slider("Surface dos (percentile Z)", 85, 99, 93, step=1)
+    cell_cm = st.slider("Taille bin X (cm)", 0.30, 1.20, 0.70, step=0.05)
+    z_perc = st.slider("Surface dos (percentile Z)", 85, 99, 92, step=1)
     q_edge = st.slider("Bords (quantile X)", 5, 20, 8, step=1)
 
     st.divider()
-    st.subheader("🧽 Lissage")
+    st.subheader("🧽 Lissage final")
     do_smooth = st.toggle("Activer", True)
     strong_smooth = st.toggle("Lissage fort (anti-pics)", True)
     smooth_window = st.slider("Fenêtre lissage", 5, 151, 91, step=2)
@@ -304,20 +444,20 @@ with st.sidebar:
     st.divider()
     ply_file = st.file_uploader("Charger Scan (.PLY)", type=["ply"])
 
-st.title("🦴 SpineScan Pro — Ligne médiane dos (Full)")
+st.title("🦴 SpineScan Pro — Midline + Fiabilité + Angles")
 
 if ply_file:
     if st.button("⚙️ LANCER L'ANALYSE BIOMÉCANIQUE"):
         pts = load_ply_numpy(ply_file) * 0.1  # mm -> cm
 
-        # nettoyage Y (moins agressif pour garder tout le haut/bas)
+        # nettoyage Y moins agressif pour garder tout le dos
         mask = (pts[:, 1] > np.percentile(pts[:, 1], 1)) & (pts[:, 1] < np.percentile(pts[:, 1], 99))
         pts = pts[mask]
 
         # centrage global X (affichage uniquement)
         pts[:, 0] -= np.median(pts[:, 0])
 
-        spine = extract_spine_midline_full(
+        spine, q = extract_midline_full_with_quality(
             pts,
             remove_lateral_outliers=remove_lat,
             cell_cm=float(cell_cm),
@@ -332,50 +472,94 @@ if ply_file:
             st.error("Impossible d'extraire une courbe (scan trop incomplet).")
             st.stop()
 
+        # lissage final (sur x,z) + on garde q tel quel
         if do_smooth:
             spine = smooth_spine(spine, window=smooth_window, strong=strong_smooth, median_k=median_k)
 
+        # métriques
         fd, fl, vertical_z = compute_sagittal_arrow_lombaire_v2(spine)
+        fl_status = classify_fl(fl, 2.5, 4.5)
         dev_f = float(np.max(np.abs(spine[:, 0]))) if spine.size else 0.0
 
+        # angles (est.)
+        lordosis_deg, kyphosis_deg = estimate_lordosis_kyphosis_angles(spine)
+
+        # couverture / fiabilité
+        y_span_pts = float(np.percentile(pts[:, 1], 98) - np.percentile(pts[:, 1], 2))
+        y_span_sp = float(np.max(spine[:, 1]) - np.min(spine[:, 1])) if spine.shape[0] else 0.0
+        coverage_pct = 100.0 * (y_span_sp / y_span_pts) if y_span_pts > 1e-6 else 0.0
+
+        reliability_pct = 100.0 * float(np.mean(q >= 0.6)) if q.size else 0.0
+
+        # ---------- FIGURES ----------
         tmp = tempfile.gettempdir()
         img_f_p, img_s_p = os.path.join(tmp, "f.png"), os.path.join(tmp, "s.png")
 
-        fig_f, ax_f = plt.subplots(figsize=(2.2, 4))
+        # Frontale (x vs y) avec couleur fiabilité
+        fig_f, ax_f = plt.subplots(figsize=(2.4, 4.2))
         ax_f.scatter(pts[:, 0], pts[:, 1], s=0.2, alpha=0.08, color="gray")
-        ax_f.plot(spine[:, 0], spine[:, 1], "red", linewidth=2.6)
-        ax_f.set_title("Frontale (midline full)", fontsize=9)
+        plot_colored_curve(ax_f, spine[:, 0], spine[:, 1], q, lw=2.8)
+        ax_f.set_title("Frontale (couleur = fiabilité)", fontsize=9)
         ax_f.axis("off")
-        fig_f.savefig(img_f_p, bbox_inches="tight", dpi=160)
+        fig_f.savefig(img_f_p, bbox_inches="tight", dpi=170)
 
-        fig_s, ax_s = plt.subplots(figsize=(2.2, 4))
+        # Sagittale (z vs y) avec couleur fiabilité
+        fig_s, ax_s = plt.subplots(figsize=(2.4, 4.2))
         ax_s.scatter(pts[:, 2], pts[:, 1], s=0.2, alpha=0.08, color="gray")
-        ax_s.plot(spine[:, 2], spine[:, 1], "blue", linewidth=2.6)
+        plot_colored_curve(ax_s, spine[:, 2], spine[:, 1], q, lw=2.8)
         if vertical_z.size:
             ax_s.plot(vertical_z, spine[:, 1], "k--", alpha=0.7, linewidth=1)
-        ax_s.set_title("Sagittale", fontsize=9)
+        ax_s.set_title("Sagittale (couleur = fiabilité)", fontsize=9)
         ax_s.axis("off")
-        fig_s.savefig(img_s_p, bbox_inches="tight", dpi=160)
+        fig_s.savefig(img_s_p, bbox_inches="tight", dpi=170)
 
         st.write("### 📈 Analyse Visuelle")
         _, c1, c2, _ = st.columns([1, 1, 1, 1])
         c1.pyplot(fig_f)
         c2.pyplot(fig_s)
 
+        # Barre couleur fiabilité
+        st.write("### 🎨 Légende fiabilité")
+        st.caption("Rouge = faible | Jaune = moyen | Vert = fiable (score 0→1)")
+        fig_leg, ax_leg = plt.subplots(figsize=(5.0, 0.35))
+        ax_leg.set_axis_off()
+        gradient = np.linspace(0, 1, 256).reshape(1, -1)
+        ax_leg.imshow(gradient, aspect="auto", cmap="RdYlGn")
+        st.pyplot(fig_leg)
+
+        # ---------- Synthèse ----------
+        badge = '<span class="badge-ok">Normale</span>' if fl_status == "Normale" else '<span class="badge-no">Hors norme</span>'
+
         st.write("### 📋 Synthèse des résultats")
         st.markdown(f"""
         <div class="result-box">
             <p><b>📏 Flèche Dorsale :</b> <span class="value-text">{fd:.2f} cm</span></p>
-            <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span></p>
+            <p><b>📏 Flèche Lombaire :</b> <span class="value-text">{fl:.2f} cm</span> &nbsp; {badge}
+               <br><span style="color:#666;font-size:0.9rem;">Référence: 2.5 à 4.5 cm</span></p>
             <p><b>↔️ Déviation Latérale Max :</b> <span class="value-text">{dev_f:.2f} cm</span></p>
+            <p><b>📐 Angle lordose lombaire (est.) :</b> <span class="value-text">{lordosis_deg:.1f}°</span></p>
+            <p><b>📐 Angle cyphose dorsale (est.) :</b> <span class="value-text">{kyphosis_deg:.1f}°</span></p>
+            <p><b>✅ Couverture hauteur :</b> <span class="value-text">{coverage_pct:.0f}%</span>
+               &nbsp; <b>Fiabilité :</b> <span class="value-text">{reliability_pct:.0f}%</span>
+               <br><span style="color:#666;font-size:0.9rem;">Fiabilité = % des points avec score ≥ 0.60</span></p>
             <div class="disclaimer">
-                Midline full-back : tranches Y 2→98%, profil surface binned (anti-biais densité),
-                milieu entre bords (q={q_edge}%) + remplissage des manques = {str(allow_fill)}.
+                Midline “tout le dos” = milieu entre bords (bins X, anti-biais densité) + couleur selon score qualité.
+                Les angles sont des estimations basées sur la pente sagittale par zones (répétable pour suivi si protocole constant).
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        res = {"fd": fd, "fl": fl, "dev_f": dev_f}
+        # Export PDF
+        res = {
+            "fd": float(fd),
+            "fl": float(fl),
+            "fl_status": fl_status,
+            "dev_f": float(dev_f),
+            "lordosis_deg": float(lordosis_deg),
+            "kyphosis_deg": float(kyphosis_deg),
+            "coverage_pct": float(coverage_pct),
+            "reliability_pct": float(reliability_pct),
+        }
         pdf_path = export_pdf_pro({"nom": nom, "prenom": prenom}, res, img_f_p, img_s_p)
 
         st.divider()
