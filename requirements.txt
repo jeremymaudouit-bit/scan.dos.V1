@@ -1,9 +1,6 @@
 streamlit
-pyrealsense2
 numpy
 pandas
 open3d
-opencv-python
 scipy
-matplotlib
 reportlab
