@@ -1,20 +1,18 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-import open3d as o3d
+import tempfile
 from scipy.spatial.distance import euclidean
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
-import tempfile
-
 st.set_page_config(page_title="Analyse posture 3D", layout="wide")
 
-st.title("Analyse morphologique 3D (offline)")
+st.title("Analyse morphologique 3D (FULL CLOUD SAFE)")
 
 uploaded_file = st.file_uploader(
-    "Importer un fichier PLY (export RealSense)",
-    type=["ply"]
+    "Importer un fichier CSV de points 3D",
+    type=["csv"]
 )
 
 # =========================
@@ -45,16 +43,15 @@ def export_pdf(metrics, path):
     doc.build(elements)
 
 # =========================
-# ANALYSE PLY
+# ANALYSE CSV POINT CLOUD
 # =========================
 
-def analyze_ply(file_path):
+def analyze_csv(file_path):
 
-    pcd = o3d.io.read_point_cloud(file_path)
+    df = pd.read_csv(file_path)
 
-    points = np.asarray(pcd.points)
+    points = df[["x", "y", "z"]].values
 
-    # filtrage corps
     body = points[
         (points[:, 2] > 0.5) &
         (points[:, 2] < 2.2) &
@@ -66,7 +63,6 @@ def analyze_ply(file_path):
     n = len(body)
 
     upper = body[:n//3]
-    middle = body[n//3:2*n//3]
     lower = body[2*n//3:]
 
     # épaules
@@ -105,32 +101,20 @@ def analyze_ply(file_path):
 
 if uploaded_file:
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".ply") as tmp:
-
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
         tmp.write(uploaded_file.read())
         path = tmp.name
 
     st.info("Analyse en cours...")
 
-    metrics = analyze_ply(path)
+    metrics = analyze_csv(path)
 
-    st.success("Analyse terminée")
-
-    df = pd.DataFrame([metrics])
-
-    st.dataframe(df)
-
-    st.subheader("Résultats")
+    st.success("Terminé")
 
     st.write(metrics)
 
-    # PDF
-    pdf_path = "rapport_postural.pdf"
+    pdf_path = "rapport.pdf"
     export_pdf(metrics, pdf_path)
 
     with open(pdf_path, "rb") as f:
-        st.download_button(
-            "Télécharger PDF",
-            f,
-            file_name="rapport_postural.pdf"
-        )
+        st.download_button("Télécharger PDF", f, file_name="rapport.pdf")
